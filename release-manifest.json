@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "product": "codex-windows-status-pet",
+  "display_name": "Codex Windows Status Pet",
+  "version": "1.1.0",
+  "platform": "windows",
+  "arch": "x64",
+  "runtime": "python",
+  "minimum_python": "3.10",
+  "entrypoint": "scripts/codex_status_pet.py",
+  "launcher": "launch.vbs",
+  "icon": "assets/CodexStatusPet.ico"
+}

@@ -19,8 +19,10 @@ $productProcesses | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Error
 $productProcesses | ForEach-Object { Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue }
 
 $desktop = [Environment]::GetFolderPath('Desktop')
+$startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
 $programs = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
 Remove-Item -LiteralPath (Join-Path $desktop 'Codex Windows Status Pet.lnk') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $startup 'Codex Windows Status Pet.lnk') -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $programs 'Codex Windows Status Pet.lnk') -Force -ErrorAction SilentlyContinue
 for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $resolvedRoot); $attempt++) {
     Remove-Item -LiteralPath $resolvedRoot -Recurse -Force -ErrorAction SilentlyContinue
