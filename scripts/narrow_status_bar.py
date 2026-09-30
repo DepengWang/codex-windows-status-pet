@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 import tkinter as tk
+import time
 from ctypes import Structure, byref, c_long, windll
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from api.quota_parse_api import parse_quota_payload
 
 WIDTH, HEIGHT = 613, 46
 BG, FG, MUTED, ACCENT, ERROR = "#0b1220", "#e5e7eb", "#9ca3af", "#60a5fa", "#f87171"
+QUOTA_GREEN, QUOTA_YELLOW, QUOTA_RED = "#4ade80", "#facc15", "#f87171"
+RED_SHORTFALL_PERCENT = 20
 SETTINGS_PATH = Path(__file__).resolve().parents[1] / "narrow-status-bar.json"
 DEFAULT_X, DEFAULT_Y = -4, -48
 
@@ -66,6 +69,26 @@ def time_text(value):
     return local_time_date(value) if value is not None else "--"
 
 
+def quota_color(window):
+    """Color quota by comparing remaining quota with remaining window time."""
+    if not isinstance(window, dict):
+        return QUOTA_GREEN
+    used = window.get("usedPercent")
+    duration = window.get("windowDurationMins")
+    reset_at = earliest_future_expiry(window.get("resetsAt"))
+    if not isinstance(used, (int, float)) or not isinstance(duration, int) or not reset_at:
+        return QUOTA_GREEN
+    remaining_quota = max(0.0, min(100.0, 100.0 - float(used)))
+    remaining_time = max(0.0, reset_at - time.time())
+    remaining_time_percent = min(100.0, remaining_time / (duration * 60.0) * 100.0)
+    delta = remaining_quota - remaining_time_percent
+    if delta <= -RED_SHORTFALL_PERCENT:
+        return QUOTA_RED
+    if delta < 0:
+        return QUOTA_YELLOW
+    return QUOTA_GREEN
+
+
 class NarrowBar(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -87,21 +110,30 @@ class NarrowBar(tk.Tk):
         self.refreshing = False
         self.closed = False
 
-        self.line1 = tk.Label(self, text="Codex 连接中…", bg=BG, fg=FG, anchor="w", font=("Segoe UI", 12, "bold"))
-        self.line1.place(x=12, y=4, width=WIDTH - 116, height=18)
-        self.line2 = tk.Label(self, text="额度读取中…", bg=BG, fg=MUTED, anchor="w", font=("Segoe UI", 9))
+        self.line1 = tk.Frame(self, bg=BG)
+        self.line1.place(x=12, y=1, width=WIDTH - 50, height=23)
+        line_font = ("Consolas", 12)
+        self.line1_status = tk.Label(self.line1, text="Codex Connecting…", bg=BG, fg=FG, anchor="w", font=line_font)
+        self.line1_primary = tk.Label(self.line1, text="", bg=BG, fg=QUOTA_GREEN, anchor="w", font=line_font)
+        self.line1_separator = tk.Label(self.line1, text="", bg=BG, fg=FG, anchor="w", font=line_font)
+        self.line1_weekly = tk.Label(self.line1, text="", bg=BG, fg=QUOTA_GREEN, anchor="w", font=line_font)
+        self.line1_status.pack(side="left")
+        self.line1_primary.pack(side="left", padx=(12, 0))
+        self.line1_separator.pack(side="left", padx=(12, 0))
+        self.line1_weekly.pack(side="left", padx=(4, 0))
+        self.line2 = tk.Label(self, text="Loading quota…", bg=BG, fg=MUTED, anchor="w", font=("Consolas", 12))
         self.line2.place(x=12, y=max(22, self.bar_height - 22), width=WIDTH - 116, height=18)
         self.refresh_button = tk.Button(self, text="↻", command=self.refresh, bg=BG, fg=ACCENT, activebackground="#16233a", activeforeground=FG, bd=0, highlightthickness=0, font=("Segoe UI", 11, "bold"))
-        self.refresh_button.place(x=WIDTH - 96, y=4, width=28, height=36)
+        self.refresh_button.place_forget()
         self.compact_button = tk.Button(self, text="↕", command=self.toggle_compact, bg=BG, fg=MUTED, activebackground="#16233a", activeforeground=FG, bd=0, highlightthickness=0, font=("Segoe UI", 10))
-        self.compact_button.place(x=WIDTH - 66, y=4, width=28, height=36)
+        self.compact_button.place_forget()
         self.close_button = tk.Button(self, text="×", command=self.close, bg=BG, fg=MUTED, activebackground="#3a1720", activeforeground=ERROR, bd=0, highlightthickness=0, font=("Segoe UI", 14))
-        self.close_button.place(x=WIDTH - 36, y=3, width=28, height=36)
-        for widget in (self, self.line1, self.line2):
+        self.close_button.place(x=WIDTH - 30, y=max(0, self.bar_height - 32), width=28, height=32)
+        for widget in (self, self.line1, self.line1_status, self.line1_primary, self.line1_separator, self.line1_weekly, self.line2):
             widget.bind("<ButtonPress-1>", self.begin_drag)
             widget.bind("<B1-Motion>", self.drag)
             widget.bind("<ButtonRelease-1>", self.end_drag)
-        for widget in (self, self.line1, self.line2, self.refresh_button, self.compact_button, self.close_button):
+        for widget in (self, self.line1, self.line1_status, self.line1_primary, self.line1_separator, self.line1_weekly, self.line2, self.refresh_button, self.compact_button, self.close_button):
             widget.bind("<Enter>", self.pointer_enter, add="+")
             widget.bind("<Leave>", self.pointer_leave, add="+")
         # Start with the same transparent background used when the pointer leaves.
@@ -125,6 +157,7 @@ class NarrowBar(tk.Tk):
                 self.bar_height = new_height
                 self.taskbar_y = new_taskbar_y
                 self.line2.place_configure(y=max(22, self.bar_height - 22))
+                self.close_button.place_configure(y=max(0, self.bar_height - 32))
                 self.geometry(f"{WIDTH}x{self.bar_height}+{current_x}+{self.taskbar_y}")
                 self.settings.update(x=current_x, y=self.taskbar_y)
                 save_settings(self.settings)
@@ -225,8 +258,11 @@ class NarrowBar(tk.Tk):
 
     def show_offline(self):
         self.refreshing = False
-        self.line1.configure(text="Codex  离线 / 额度不可用", fg=ERROR)
-        self.line2.configure(text="请确认 Codex 可用；不会显示估算值")
+        self.line1_status.configure(text="Codex Offline / Quota unavailable", fg=ERROR)
+        self.line1_primary.configure(text="", fg=QUOTA_GREEN)
+        self.line1_separator.configure(text="")
+        self.line1_weekly.configure(text="", fg=QUOTA_GREEN)
+        self.line2.configure(text="Check that Codex is available; estimates are not shown")
 
     def show_quota(self, data):
         self.refreshing = False
@@ -236,11 +272,14 @@ class NarrowBar(tk.Tk):
         primary_left = 100 - float(primary.get("usedPercent", 100)) if primary else None
         weekly_left = 100 - float(weekly.get("usedPercent", 100)) if weekly else None
         def pct(value): return "--" if value is None else f"{max(0, min(100, round(value)))}%"
-        p = f"5h {pct(primary_left)} · 重置 {time_text(primary.get('resetsAt'))}"
-        w = f"周 {pct(weekly_left)} · 重置 {time_text(weekly.get('resetsAt'))}"
+        p = f"5h {pct(primary_left)} | {time_text(primary.get('resetsAt'))}"
+        w = f"WEEK {pct(weekly_left)} | {time_text(weekly.get('resetsAt'))}"
         credits = data.get("rateLimitResetCredits", {}).get("availableCount", "--")
-        self.line1.configure(text=f"Codex  实时   {p}     {w}", fg=FG)
-        self.line2.configure(text=f"可用重置次数 {credits}     每 5 秒自动刷新     手动刷新 ↻     拖动窗口可移动")
+        self.line1_status.configure(text="Codex LIVE", fg=FG)
+        self.line1_primary.configure(text=p, fg=quota_color(primary))
+        self.line1_separator.configure(text="●", fg=FG)
+        self.line1_weekly.configure(text=w, fg=quota_color(weekly))
+        self.line2.configure(text=f"Reset credits {credits} ● Auto refresh 5s")
 
     def close(self):
         if self.closed:
