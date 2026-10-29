@@ -1,12 +1,17 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
-from api.quota_format_api import earliest_future_expiry, quota_line, reset_credit_line
+from api.quota_format_api import (
+    earliest_future_expiry,
+    quota_line,
+    reset_credit_line,
+    reset_display_time,
+)
 
 
 class QuotaFormatTests(unittest.TestCase):
@@ -33,6 +38,19 @@ class QuotaFormatTests(unittest.TestCase):
     def test_missing_reset_time_is_not_invented(self):
         self.assertEqual(quota_line("Weekly", "85%", None), "Weekly 85%")
         self.assertEqual(reset_credit_line(5, None), "重置 5 次")
+
+    def test_reset_today_omits_date(self):
+        now = datetime(2026, 10, 29, 9, 0).astimezone()
+        reset = now.replace(hour=21, minute=22, second=0, microsecond=0)
+        self.assertEqual(reset_display_time(reset.timestamp(), now=now), "21:22")
+
+    def test_reset_on_another_day_includes_month_and_day(self):
+        now = datetime(2026, 10, 29, 9, 0).astimezone()
+        reset = now + timedelta(days=2)
+        self.assertEqual(
+            reset_display_time(reset.timestamp(), now=now),
+            f"{reset:%H:%M} {reset.month}/{reset.day}",
+        )
 
 
 if __name__ == "__main__":

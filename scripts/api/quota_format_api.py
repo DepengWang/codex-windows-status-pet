@@ -40,6 +40,21 @@ def local_time_date(value):
             return "--"
 
 
+def reset_display_time(value, now=None):
+    """Format quota resets as HH:mm today, otherwise HH:mm M/d."""
+    timestamp = _epoch(value)
+    if timestamp is None:
+        return "—"
+    try:
+        moment = datetime.fromtimestamp(timestamp).astimezone()
+        current = (now or datetime.now().astimezone()).astimezone()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "—"
+    if moment.date() == current.date():
+        return moment.strftime("%H:%M")
+    return f"{moment.hour:02d}:{moment.minute:02d} {moment.month}/{moment.day}"
+
+
 def earliest_future_expiry(expirations, now=None):
     """Return the earliest future epoch from a mixed provider response."""
     current = datetime.now().timestamp() if now is None else float(now)
