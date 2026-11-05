@@ -11,6 +11,8 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import uuid
+import winreg
 from ctypes import POINTER, Structure, byref, c_int, c_long, c_void_p, windll, wintypes
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,16 +21,27 @@ from tkinter import font as tkfont
 from api.claude_usage_api import ClaudeUsageClient
 from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
-from api.quota_format_api import earliest_future_expiry, reset_display_time
+from api.quota_format_api import earliest_future_expiry, reset_display_date, reset_display_time
 from api.quota_parse_api import parse_quota_payload
 
 
-MAX_WIDTH = 920
-REFRESH_WIDTH = 46
+PREFERRED_BAR_WIDTH = 792
+NAME_COLUMN_MAX = 120
+NAME_COLUMN_MIN = 58
+PRIMARY_COLUMN_WIDTH = 110
+WEEKLY_COLUMN_WIDTH = 172
+THIRD_COLUMN_WIDTH = 120
+DESKTOP_COLUMN_WIDTH = 90
+DESKTOP_NAMES = ("主屏", "远程", "创作")
+DESKTOP_NAME_ALIASES = {"主屏": "主屏", "远程": "远程", "编程": "创作", "创作": "创作"}
+VIRTUAL_DESKTOPS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops"
 BG = "#101929"
 FG = "#EDF1F9"
 MUTED = "#97B1CC"
 BORDER = "#4A5A66"
+DESKTOP_ACTIVE_BG = "#5C9E6F"
+DESKTOP_INACTIVE_BG = "#34404B"
+DESKTOP_TEXT = "#FFFFFF"
 TRANSPARENT = "#010203"
 CODEX_NAME = "#C61862"
 CODEX_THIRD = "#205B4E"
@@ -43,10 +56,68 @@ REFRESH_INTERVAL_MS = 5 * 60 * 1000
 WAKE_CHECK_INTERVAL_MS = 30 * 1000
 TASKBAR_CHECK_INTERVAL_MS = 60 * 1000
 WINDOW_CHECK_INTERVAL_MS = 5 * 1000
+DESKTOP_CHECK_INTERVAL_MS = 1000
+
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_NOOWNERZORDER = 0x0200
+MIN_PREFERRED_BAR_WIDTH = 180
 
 
 class Rect(Structure):
     _fields_ = [("left", c_long), ("top", c_long), ("right", c_long), ("bottom", c_long)]
+
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+VK_CONTROL = 0x11
+KEYBOARD_UNION_SIZE = 32 if ctypes.sizeof(c_void_p) == 8 else 24
+
+
+class KeyboardInput(Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    ]
+
+
+class InputUnion(ctypes.Union):
+    _fields_ = [
+        ("ki", KeyboardInput),
+        ("padding", ctypes.c_byte * KEYBOARD_UNION_SIZE),
+    ]
+
+
+class Input(Structure):
+    _anonymous_ = ("data",)
+    _fields_ = [("type", wintypes.DWORD), ("data", InputUnion)]
+
+
+def send_control_number(number):
+    if number not in (1, 2, 3):
+        raise ValueError("Unsupported desktop shortcut")
+    digit_vk = ord("0") + number
+    events = (
+        (VK_CONTROL, 0),
+        (digit_vk, 0),
+        (digit_vk, KEYEVENTF_KEYUP),
+        (VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    inputs = (Input * len(events))()
+    for item, (virtual_key, flags) in zip(inputs, events):
+        item.type = INPUT_KEYBOARD
+        item.ki = KeyboardInput(virtual_key, 0, flags, 0, 0)
+
+    send_input = windll.user32.SendInput
+    send_input.argtypes = [wintypes.UINT, POINTER(Input), c_int]
+    send_input.restype = wintypes.UINT
+    sent = send_input(len(inputs), inputs, ctypes.sizeof(Input))
+    if sent != len(inputs):
+        raise OSError(ctypes.get_last_error(), "Windows did not accept the desktop shortcut")
 
 
 def primary_work_area():
@@ -68,6 +139,11 @@ def primary_taskbar_geometry():
     """Return the current primary taskbar height and the taskbar's top edge."""
     _left, _top, _right, work_bottom = primary_work_area()
     return primary_taskbar_height(), work_bottom
+
+
+def primary_screen_size():
+    """Return the primary screen dimensions in the same units used by Tk."""
+    return max(1, windll.user32.GetSystemMetrics(0)), max(1, windll.user32.GetSystemMetrics(1))
 
 
 def primary_start_button_left():
@@ -110,44 +186,92 @@ def width_before_start_button(x, start_left=None, gap=8):
     if start_left is None:
         start_left = primary_start_button_left()
     if start_left is None:
-        return 1
-    return max(1, min(MAX_WIDTH, int(start_left - int(x) - gap)))
+        screen_width, _screen_height = primary_screen_size()
+        start_left = screen_width
+    return max(1, min(PREFERRED_BAR_WIDTH, int(start_left - int(x) - gap)))
+
+
+def read_active_virtual_desktop_name():
+    """Map Explorer's current per-user virtual desktop ID to a display label."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, VIRTUAL_DESKTOPS_KEY) as key:
+            current_id_data, _ = winreg.QueryValueEx(key, "CurrentVirtualDesktop")
+            desktop_ids, _ = winreg.QueryValueEx(key, "VirtualDesktopIDs")
+            if not isinstance(current_id_data, (bytes, bytearray)) or len(current_id_data) != 16:
+                return None
+            if not isinstance(desktop_ids, (bytes, bytearray)) or len(desktop_ids) % 16:
+                return None
+
+            current_id = uuid.UUID(bytes_le=bytes(current_id_data))
+            active_ids = (
+                uuid.UUID(bytes_le=bytes(desktop_ids[offset:offset + 16]))
+                for offset in range(0, len(desktop_ids), 16)
+            )
+            if current_id not in active_ids:
+                return None
+
+            with winreg.OpenKey(key, f"Desktops\\{{{current_id}}}") as desktop_key:
+                desktop_name, _ = winreg.QueryValueEx(desktop_key, "Name")
+            return DESKTOP_NAME_ALIASES.get(str(desktop_name).strip())
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def column_layout(width):
-    """Allocate the available width across the four data columns and refresh."""
-    width = max(1, int(width))
-    refresh = min(REFRESH_WIDTH, max(1, round(width * 0.075)))
-    content = max(0, width - refresh)
-    name = min(160, round(content * 0.21))
-    primary = round(content * 0.22)
-    weekly = round(content * 0.26)
-    return (
-        (0, name, name + primary, name + primary + weekly, width - refresh, width),
-        refresh,
+    """Fit quota and desktop indicators, shrinking the provider-name column first."""
+    width = max(1, min(PREFERRED_BAR_WIDTH, int(width)))
+    name = min(NAME_COLUMN_MAX, width)
+    name_floor = min(NAME_COLUMN_MIN, width)
+    name -= min(max(0, name - name_floor), max(0, PREFERRED_BAR_WIDTH - width))
+    remaining = max(0, width - name)
+
+    preferred = (
+        PRIMARY_COLUMN_WIDTH,
+        WEEKLY_COLUMN_WIDTH,
+        THIRD_COLUMN_WIDTH,
+        DESKTOP_COLUMN_WIDTH,
+        DESKTOP_COLUMN_WIDTH,
+        DESKTOP_COLUMN_WIDTH,
     )
+    preferred_total = sum(preferred)
+    columns = [remaining * value // preferred_total for value in preferred]
+    for index in range(remaining - sum(columns)):
+        columns[index] += 1
+
+    edges = [0, name]
+    for column_width in columns:
+        edges.append(edges[-1] + column_width)
+    return tuple(edges)
 
 
-def primary_screen_has_fullscreen_foreground():
-    get_foreground = windll.user32.GetForegroundWindow
-    get_foreground.restype = c_void_p
-    foreground = get_foreground()
-    if not foreground:
+def set_window_topmost(hwnd):
+    if not hwnd:
         return False
-    rect = Rect()
-    get_rect = windll.user32.GetWindowRect
-    get_rect.argtypes = [c_void_p, POINTER(Rect)]
-    get_rect.restype = c_int
-    if not get_rect(foreground, byref(rect)):
-        return False
-    screen_width = windll.user32.GetSystemMetrics(0)
-    screen_height = windll.user32.GetSystemMetrics(1)
-    return (
-        rect.left <= 1
-        and rect.top <= 1
-        and rect.right >= screen_width - 1
-        and rect.bottom >= screen_height - 1
-    )
+    set_pos = windll.user32.SetWindowPos
+    set_pos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        wintypes.UINT,
+    ]
+    set_pos.restype = wintypes.BOOL
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+    return bool(set_pos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags))
+
+
+def fit_text(text, font, width):
+    """Return a single-line label that fits its cell without crossing a divider."""
+    if width <= 0:
+        return ""
+    if font.measure(text) <= width:
+        return text
+    suffix = "…"
+    while text and font.measure(text + suffix) > width:
+        text = text[:-1]
+    return text + suffix if text else (suffix if font.measure(suffix) <= width else "")
 
 
 def load_settings():
@@ -328,13 +452,30 @@ class NarrowBar(tk.Tk):
         self.settings = load_settings()
         self.bar_height, self.taskbar_y = primary_taskbar_geometry()
         self.start_button_left = primary_start_button_left()
+        self.screen_width, self.screen_height = primary_screen_size()
+        initial_x = max(-4, min(self.settings["x"], self.screen_width - 1))
+        initial_width = width_before_start_button(initial_x, self.start_button_left)
+        if initial_width < MIN_PREFERRED_BAR_WIDTH and initial_x > -4:
+            left_width = width_before_start_button(-4, self.start_button_left)
+            if left_width > initial_width:
+                initial_x = -4
+        self.settings["x"] = initial_x
         self.bar_width = width_before_start_button(
-            self.settings["x"], start_left=self.start_button_left
+            initial_x, start_left=self.start_button_left
         )
-        self.column_edges, self.refresh_width = column_layout(self.bar_width)
+        self.column_edges = column_layout(self.bar_width)
         self.start_boundary_unavailable = self.start_button_left is None
-        if self.bar_width == 1:
-            LOGGER.warning("Start button boundary unavailable; overlay width minimized")
+        self.layout_signature = (
+            self.screen_width,
+            self.screen_height,
+            self.bar_height,
+            self.taskbar_y,
+            self.start_button_left,
+        )
+        self.taskbar_alignment_job = None
+        self.desktop_check_job = None
+        if self.start_boundary_unavailable:
+            LOGGER.warning("Start button boundary unavailable; using primary screen edge as width limit")
         self.title("Codex and Claude Usage")
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -344,7 +485,6 @@ class NarrowBar(tk.Tk):
         self.resizable(False, False)
 
         self.closed = False
-        self.hidden_for_fullscreen = False
         self.drag_origin = None
         self.drag_moved = False
         self.hovered = False
@@ -361,6 +501,11 @@ class NarrowBar(tk.Tk):
         self.last_wake_wall = time.time()
         self.last_wake_mono = time.monotonic()
         self.last_action_error = None
+        self.active_desktop_name = read_active_virtual_desktop_name()
+        LOGGER.info(
+            "active virtual desktop indicator initialized: %s",
+            self.active_desktop_name or "unavailable",
+        )
 
         self.providers = {
             "Codex": {
@@ -392,7 +537,7 @@ class NarrowBar(tk.Tk):
         self.font_ui = tkfont.Font(self, family="Segoe UI", size=-13)
         self.font_bold = tkfont.Font(self, family="Segoe UI", size=-13, weight="bold")
         self.font_numbers = tkfont.Font(self, family="Consolas", size=-13)
-        self.font_refresh = tkfont.Font(self, family="Segoe UI Symbol", size=-21)
+        self.font_desktop = tkfont.Font(self, family="Segoe UI", size=-17)
         self.apply_transparency()
         self.draw_bar()
 
@@ -408,8 +553,9 @@ class NarrowBar(tk.Tk):
         self.after(100, self.refresh)
         self.after(REFRESH_INTERVAL_MS, self.auto_refresh)
         self.after(WAKE_CHECK_INTERVAL_MS, self.check_wake)
-        self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
-        self.after(WINDOW_CHECK_INTERVAL_MS, self.check_fullscreen_state)
+        self.taskbar_alignment_job = self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
+        self.desktop_check_job = self.after(DESKTOP_CHECK_INTERVAL_MS, self.check_active_desktop)
+        self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
 
     def apply_transparency(self):
         try:
@@ -450,23 +596,43 @@ class NarrowBar(tk.Tk):
                     fill=CODEX_THIRD if row == 0 else CLAUDE_THIRD,
                     outline="",
                 )
+
+        for index, name in enumerate(DESKTOP_NAMES):
+            left, right = edges[4 + index], edges[5 + index]
+            c.create_rectangle(
+                left + 1,
+                1,
+                right - 1,
+                self.bar_height - 1,
+                fill=DESKTOP_ACTIVE_BG if name == self.active_desktop_name else DESKTOP_INACTIVE_BG,
+                outline="",
+            )
+
+        if self.background_visible:
             for x in edges[1:-1]:
                 c.create_line(x, 0, x, self.bar_height, fill=BORDER, width=1)
-            c.create_line(0, mid, edges[-2], mid, fill=BORDER, width=1)
-            self._draw_outer_frame_without_refresh_edges(edges[-2])
+            c.create_line(0, mid, edges[4], mid, fill=BORDER, width=1)
+            self._draw_outer_frame_to_data_end(edges[4])
 
         self._draw_provider("Codex", 0, row_centres[0])
         self._draw_provider("Claude", 1, row_centres[1])
-        c.create_text(
-            width - self.refresh_width / 2,
-            self.bar_height / 2,
-            anchor="center",
-            text="↻",
-            fill=MUTED,
-            font=self.font_refresh,
-        )
+        self._draw_desktop_indicators(edges)
 
-    def _draw_outer_frame_without_refresh_edges(self, refresh_left):
+    def _draw_desktop_indicators(self, edges):
+        center_y = self.bar_height / 2
+        for index, name in enumerate(DESKTOP_NAMES):
+            left, right = edges[4 + index], edges[5 + index]
+            center_x = (left + right) / 2
+            self.canvas.create_text(
+                center_x,
+                center_y,
+                anchor="center",
+                text=name,
+                fill=DESKTOP_TEXT,
+                font=self.font_desktop,
+            )
+
+    def _draw_outer_frame_to_data_end(self, content_right):
         c = self.canvas
         left = 0.5
         top = 0.5
@@ -478,13 +644,13 @@ class NarrowBar(tk.Tk):
             left, top, right, top + 2 * radius,
             start=90, extent=90, style="arc", outline=BORDER, width=1,
         )
-        c.create_line(left + radius, top, refresh_left, top, fill=BORDER, width=1)
+        c.create_line(left + radius, top, content_right, top, fill=BORDER, width=1)
         c.create_line(left, top + radius, left, bottom - radius, fill=BORDER, width=1)
         c.create_arc(
             left, bottom - 2 * radius, right, bottom,
             start=180, extent=90, style="arc", outline=BORDER, width=1,
         )
-        c.create_line(left + radius, bottom, refresh_left, bottom, fill=BORDER, width=1)
+        c.create_line(left + radius, bottom, content_right, bottom, fill=BORDER, width=1)
 
     def _rounded_rect(self, x1, y1, x2, y2, radius, fill, outline=""):
         points = (
@@ -534,23 +700,27 @@ class NarrowBar(tk.Tk):
             "connecting": DOT_REFRESHING,
             "offline": DOT_OFFLINE,
         }.get(state["state"], DOT_OFFLINE)
+        name_width = max(0, edges[1] - x0)
+        dot_x = x0 + min(11, max(4, round(name_width * 0.14)))
+        label_x = x0 + min(23, max(14, round(name_width * 0.30)))
+        label_width = max(0, edges[1] - label_x - 4)
         self.canvas.create_oval(
-            x0 + 11,
+            dot_x,
             y - 2.5,
-            x0 + 16,
+            dot_x + 5,
             y + 2.5,
             fill=dot_color,
             outline="",
         )
         label = name if state["state"] == "live" else f"{name} {state['state'].title()}"
+        label = fit_text(label, self.font_bold, label_width)
         self.canvas.create_text(
-            x0 + 23,
+            label_x,
             y,
             anchor="w",
             text=label,
             fill=FG,
             font=self.font_bold,
-            width=max(1, edges[1] - x0 - 30),
         )
 
         snapshot = state["snapshot"] or {}
@@ -558,10 +728,9 @@ class NarrowBar(tk.Tk):
         weekly = snapshot.get("weekly") or {}
         if name == "Codex":
             third_segments = [
-                ("Reset ", self.font_ui),
                 (_count_text(snapshot.get("resetCount")), self.font_numbers),
-                (" times / ", self.font_ui),
-                (_reset(snapshot.get("resetAt")), self.font_numbers),
+                (" times ", self.font_ui),
+                (reset_display_date(snapshot.get("resetAt")), self.font_numbers),
             ]
             third_bg = CODEX_THIRD
             name_bg = CODEX_NAME
@@ -743,7 +912,7 @@ class NarrowBar(tk.Tk):
         if self.drag_moved:
             new_x = window_x + dx
             self.bar_width = width_before_start_button(new_x, self.drag_start_left)
-            self.column_edges, self.refresh_width = column_layout(self.bar_width)
+            self.column_edges = column_layout(self.bar_width)
             self.canvas.configure(width=self.bar_width)
             self.geometry(f"{self.bar_width}x{self.bar_height}+{new_x}+{self.taskbar_y}")
             self.draw_bar()
@@ -756,10 +925,24 @@ class NarrowBar(tk.Tk):
         if was_dragged:
             self.settings.update(x=self.winfo_x(), y=self.taskbar_y)
             save_settings(self.settings)
-        elif event.x >= self.bar_width - self.refresh_width:
-            self.refresh()
         else:
-            self.show_menu(event.x_root, event.y_root)
+            desktop_index = next(
+                (
+                    index
+                    for index in range(len(DESKTOP_NAMES))
+                    if self.column_edges[4 + index] <= event.x < self.column_edges[5 + index]
+                ),
+                None,
+            )
+            if desktop_index is not None:
+                shortcut_number = desktop_index + 1
+                try:
+                    send_control_number(shortcut_number)
+                    LOGGER.info("virtual desktop shortcut sent: Ctrl+%s", shortcut_number)
+                except Exception as error:
+                    log_exception("virtual desktop shortcut failed", error)
+            else:
+                self.show_menu(event.x_root, event.y_root)
 
     def open_menu_event(self, event):
         self._hide_tooltip()
@@ -794,7 +977,7 @@ class NarrowBar(tk.Tk):
         self.settings.update(x=DEFAULT_X, y=self.taskbar_y)
         self.start_button_left = primary_start_button_left()
         self.bar_width = width_before_start_button(DEFAULT_X, self.start_button_left)
-        self.column_edges, self.refresh_width = column_layout(self.bar_width)
+        self.column_edges = column_layout(self.bar_width)
         self.canvas.configure(width=self.bar_width)
         self.geometry(f"{self.bar_width}x{self.bar_height}+{DEFAULT_X}+{self.taskbar_y}")
         self.draw_bar()
@@ -946,56 +1129,112 @@ class NarrowBar(tk.Tk):
         self.reset_job = None
         self.refresh()
 
+    def check_active_desktop(self):
+        if self.closed:
+            return
+        current = read_active_virtual_desktop_name()
+        if current != self.active_desktop_name:
+            self.active_desktop_name = current
+            LOGGER.info(
+                "active virtual desktop indicator changed: %s",
+                current or "unavailable",
+            )
+            self.draw_bar()
+        if not self.closed:
+            self.desktop_check_job = self.after(DESKTOP_CHECK_INTERVAL_MS, self.check_active_desktop)
+
     def ensure_taskbar_alignment(self):
         if self.closed:
             return
+        self.taskbar_alignment_job = None
         try:
             new_height, new_taskbar_y = primary_taskbar_geometry()
-            current_x = self.winfo_x()
+            new_screen_width, new_screen_height = primary_screen_size()
+            current_x = max(-4, min(self.winfo_x(), new_screen_width - 1))
             new_start_left = primary_start_button_left()
             new_width = width_before_start_button(current_x, new_start_left)
+            signature = (
+                new_screen_width,
+                new_screen_height,
+                new_height,
+                new_taskbar_y,
+                new_start_left,
+            )
+            environment_changed = signature != self.layout_signature
+            if (
+                environment_changed
+                and new_width < MIN_PREFERRED_BAR_WIDTH
+                and current_x > -4
+            ):
+                left_width = width_before_start_button(-4, new_start_left)
+                if left_width > new_width:
+                    current_x = -4
+                    new_width = left_width
             if new_start_left is None and not self.start_boundary_unavailable:
-                LOGGER.warning("Start button boundary unavailable; overlay width minimized")
+                LOGGER.warning("Start button boundary unavailable; using primary screen edge as width limit")
             elif new_start_left is not None and self.start_boundary_unavailable:
                 LOGGER.info("Start button boundary detected; overlay width restored")
             self.start_boundary_unavailable = new_start_left is None
             if (
-                new_height != self.bar_height
+                environment_changed
+                or new_screen_width != self.screen_width
+                or new_screen_height != self.screen_height
+                or new_height != self.bar_height
                 or new_taskbar_y != self.taskbar_y
                 or new_width != self.bar_width
+                or current_x != self.winfo_x()
             ):
+                self.screen_width = new_screen_width
+                self.screen_height = new_screen_height
                 self.bar_height = new_height
                 self.taskbar_y = new_taskbar_y
                 self.start_button_left = new_start_left
                 self.bar_width = new_width
-                self.column_edges, self.refresh_width = column_layout(self.bar_width)
+                self.column_edges = column_layout(self.bar_width)
                 self.geometry(f"{self.bar_width}x{self.bar_height}+{current_x}+{self.taskbar_y}")
                 self.canvas.configure(width=self.bar_width, height=self.bar_height)
                 self.settings.update(x=current_x, y=self.taskbar_y)
                 save_settings(self.settings)
                 self.draw_bar()
+                LOGGER.info(
+                    "overlay layout recalculated: screen=%sx%s taskbar=%sx%s x=%s start-left=%s width=%s columns=%s",
+                    new_screen_width,
+                    new_screen_height,
+                    new_height,
+                    new_taskbar_y,
+                    current_x,
+                    new_start_left,
+                    new_width,
+                    self.column_edges,
+                )
+            self.layout_signature = signature
+            self.screen_width = new_screen_width
+            self.screen_height = new_screen_height
         except tk.TclError as error:
             log_exception("taskbar alignment check failed", error)
-        self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
+        if not self.closed:
+            self.taskbar_alignment_job = self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
 
-    def check_fullscreen_state(self):
+    def reassert_window_topmost(self):
         if self.closed:
             return
         try:
-            fullscreen = primary_screen_has_fullscreen_foreground()
-            if fullscreen and not self.hidden_for_fullscreen:
-                LOGGER.info("overlay hidden after full-screen foreground detection")
-                self.withdraw()
-                self.hidden_for_fullscreen = True
-            elif not fullscreen and self.hidden_for_fullscreen:
-                LOGGER.info("overlay restored after full-screen foreground ended")
+            if self.state() == "withdrawn":
                 self.deiconify()
-                self.attributes("-topmost", True)
-                self.lift()
-                self.hidden_for_fullscreen = False
+            self.attributes("-topmost", True)
+            try:
+                if not set_window_topmost(self.winfo_id()):
+                    LOGGER.warning("SetWindowPos(HWND_TOPMOST) did not succeed")
+            except Exception as error:
+                log_exception("SetWindowPos(HWND_TOPMOST) failed", error)
         except tk.TclError as error:
-            log_exception("fullscreen visibility check failed", error)
-        self.after(WINDOW_CHECK_INTERVAL_MS, self.check_fullscreen_state)
+            log_exception("topmost reassertion failed", error)
+
+    def check_window_visibility(self):
+        if self.closed:
+            return
+        self.reassert_window_topmost()
+        self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
 
     def close(self):
         if self.closed:
@@ -1004,6 +1243,18 @@ class NarrowBar(tk.Tk):
         self.closed = True
         self.settings.update(x=self.winfo_x(), y=self.taskbar_y)
         save_settings(self.settings)
+        if self.taskbar_alignment_job is not None:
+            try:
+                self.after_cancel(self.taskbar_alignment_job)
+            except tk.TclError:
+                pass
+            self.taskbar_alignment_job = None
+        if self.desktop_check_job is not None:
+            try:
+                self.after_cancel(self.desktop_check_job)
+            except tk.TclError:
+                pass
+            self.desktop_check_job = None
         self._hide_tooltip()
         try:
             self.server.stop()

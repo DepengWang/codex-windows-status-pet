@@ -55,6 +55,18 @@ def reset_display_time(value, now=None):
     return f"{moment.hour:02d}:{moment.minute:02d} {moment.month}/{moment.day}"
 
 
+def reset_display_date(value):
+    """Format a quota reset as a local M/d date without its time."""
+    timestamp = _epoch(value)
+    if timestamp is None:
+        return "—"
+    try:
+        moment = datetime.fromtimestamp(timestamp).astimezone()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "—"
+    return f"{moment.month}/{moment.day}"
+
+
 def earliest_future_expiry(expirations, now=None):
     """Return the earliest future epoch from a mixed provider response."""
     current = datetime.now().timestamp() if now is None else float(now)
