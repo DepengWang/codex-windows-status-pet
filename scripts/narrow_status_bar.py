@@ -22,6 +22,14 @@ from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
 from api.quota_format_api import earliest_future_expiry, reset_display_date, reset_display_time
 from api.quota_parse_api import parse_quota_payload
+from api.win_shell_api import (
+    Rect,
+    SHELL_FLYOUT_CLASSES,
+    WinEventHook,
+    set_window_topmost,
+    toplevel_hwnd,
+    window_needs_topmost,
+)
 from api.virtual_desktop_api import (
     DESKTOP_NAMES,
     DESKTOP_NAME_ALIASES,
@@ -61,21 +69,13 @@ REFRESH_INTERVAL_MS = 5 * 60 * 1000
 CLAUDE_REFRESH_INTERVAL_S = 20 * 60
 WAKE_CHECK_INTERVAL_MS = 30 * 1000
 TASKBAR_CHECK_INTERVAL_MS = 60 * 1000
-WINDOW_CHECK_INTERVAL_MS = 2 * 1000  # cheap GetWindow check; SetWindowPos only when covered
+WINDOW_CHECK_INTERVAL_MS = 15 * 1000  # backstop; WinEvent hook triggers the normal checks
+TOPMOST_EVENT_DEBOUNCE_MS = 150
 DESKTOP_POLL_FALLBACK_MS = 1000  # only used when the registry watcher cannot start
 DESKTOP_SAFETY_POLL_MS = 30 * 1000  # backstop while the watcher is active
 MIC_BATTERY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
-SHELL_FLYOUT_CLASSES = {"Windows.UI.Core.CoreWindow"}  # Start/Search flyouts only
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOACTIVATE = 0x0010
-SWP_NOOWNERZORDER = 0x0200
 MIN_PREFERRED_BAR_WIDTH = 180
-
-
-class Rect(Structure):
-    _fields_ = [("left", c_long), ("top", c_long), ("right", c_long), ("bottom", c_long)]
 
 
 INPUT_KEYBOARD = 1
@@ -226,71 +226,6 @@ def column_layout(width):
     for column_width in columns:
         edges.append(edges[-1] + column_width)
     return tuple(edges)
-
-
-def set_window_topmost(hwnd):
-    if not hwnd:
-        return False
-    set_pos = windll.user32.SetWindowPos
-    set_pos.argtypes = [
-        wintypes.HWND,
-        wintypes.HWND,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        wintypes.UINT,
-    ]
-    set_pos.restype = wintypes.BOOL
-    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
-    return bool(set_pos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags))
-
-
-def toplevel_hwnd(widget_id):
-    """Tk's winfo_id() is the inner child; z-order lives on its parent frame."""
-    user32 = windll.user32
-    user32.GetParent.argtypes = [wintypes.HWND]
-    user32.GetParent.restype = wintypes.HWND
-    return user32.GetParent(widget_id) or widget_id
-
-
-def window_needs_topmost(hwnd):
-    """True when a visible window covers ours and no Start/Search flyout is active.
-
-    Re-asserting HWND_TOPMOST unconditionally fights Start/Search flyouts for z-order.
-    Invisible topmost helpers (IME etc.) always sit above us and are ignored.
-    """
-    user32 = windll.user32
-    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
-    user32.GetWindow.restype = wintypes.HWND
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.GetWindowRect.argtypes = [wintypes.HWND, POINTER(Rect)]
-    covered = False
-    above = user32.GetWindow(hwnd, 3)  # GW_HWNDPREV
-    for _ in range(64):
-        if not above:
-            break
-        rect = Rect()
-        if (
-            user32.IsWindowVisible(above)
-            and user32.GetWindowRect(above, byref(rect))
-            and rect.right > rect.left
-            and rect.bottom > rect.top
-        ):
-            covered = True
-            break
-        above = user32.GetWindow(above, 3)
-    if not covered:
-        return False
-    user32.GetForegroundWindow.restype = wintypes.HWND
-    foreground = user32.GetForegroundWindow()
-    if foreground:
-        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, c_int]
-        buffer = ctypes.create_unicode_buffer(96)
-        user32.GetClassNameW(foreground, buffer, len(buffer))
-        if buffer.value in SHELL_FLYOUT_CLASSES:
-            return False
-    return True
 
 
 def fit_text(text, font, width):
@@ -604,6 +539,9 @@ class NarrowBar(tk.Tk):
         self.desktop_check_job = self.after(self.desktop_poll_ms, self.check_active_desktop)
         self.mic_battery_job = self.after(250, self.refresh_mic_battery)
         self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
+        self.topmost_job = None
+        self.topmost_hook = WinEventHook(self._topmost_signal)
+        LOGGER.info("foreground WinEvent hook active=%s", self.topmost_hook.start())
 
     def apply_transparency(self):
         try:
@@ -1433,12 +1371,31 @@ class NarrowBar(tk.Tk):
             if not window_needs_topmost(hwnd):
                 return
             try:
-                if not set_window_topmost(hwnd):
+                if set_window_topmost(hwnd):
+                    LOGGER.info("overlay was covered; topmost restored")
+                else:
                     LOGGER.warning("SetWindowPos(HWND_TOPMOST) did not succeed")
             except Exception as error:
                 log_exception("SetWindowPos(HWND_TOPMOST) failed", error)
         except tk.TclError as error:
             log_exception("topmost reassertion failed", error)
+
+    def _topmost_signal(self):
+        """Hook thread: only hand off to the Tk thread, never touch widgets here."""
+        try:
+            self.after(0, self._topmost_event)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _topmost_event(self):
+        """Foreground/minimise event: re-check shortly, after the shell settles."""
+        if self.closed or self.topmost_job is not None:
+            return
+        self.topmost_job = self.after(TOPMOST_EVENT_DEBOUNCE_MS, self._topmost_event_check)
+
+    def _topmost_event_check(self):
+        self.topmost_job = None
+        self.reassert_window_topmost()
 
     def check_window_visibility(self):
         if self.closed:
@@ -1472,6 +1429,10 @@ class NarrowBar(tk.Tk):
                 pass
             self.mic_battery_job = None
         self._hide_tooltip()
+        try:
+            self.topmost_hook.stop()
+        except Exception as error:
+            log_exception("removing WinEvent hook failed", error)
         try:
             self.desktop_watcher.stop()
         except Exception as error:
