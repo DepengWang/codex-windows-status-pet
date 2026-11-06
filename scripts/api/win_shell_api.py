@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
-from ctypes import POINTER, Structure, byref, c_int, c_long, windll, wintypes
+from ctypes import POINTER, Structure, byref, c_int, c_long, c_void_p, windll, wintypes
 
 
 # Start/Search flyouts live in this window class; do not fight them for z-order.
@@ -206,3 +206,115 @@ class WinEventHook:
             windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         thread.join(2)
         self._installed = False
+
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+VK_CONTROL = 0x11
+KEYBOARD_UNION_SIZE = 32 if ctypes.sizeof(c_void_p) == 8 else 24
+
+
+class KeyboardInput(Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    ]
+
+
+class InputUnion(ctypes.Union):
+    _fields_ = [
+        ("ki", KeyboardInput),
+        ("padding", ctypes.c_byte * KEYBOARD_UNION_SIZE),
+    ]
+
+
+class Input(Structure):
+    _anonymous_ = ("data",)
+    _fields_ = [("type", wintypes.DWORD), ("data", InputUnion)]
+
+
+def send_control_number(number):
+    if number not in (1, 2, 3):
+        raise ValueError("Unsupported desktop shortcut")
+    digit_vk = ord("0") + number
+    events = (
+        (VK_CONTROL, 0),
+        (digit_vk, 0),
+        (digit_vk, KEYEVENTF_KEYUP),
+        (VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    inputs = (Input * len(events))()
+    for item, (virtual_key, flags) in zip(inputs, events):
+        item.type = INPUT_KEYBOARD
+        item.ki = KeyboardInput(virtual_key, 0, flags, 0, 0)
+
+    send_input = windll.user32.SendInput
+    send_input.argtypes = [wintypes.UINT, POINTER(Input), c_int]
+    send_input.restype = wintypes.UINT
+    sent = send_input(len(inputs), inputs, ctypes.sizeof(Input))
+    if sent != len(inputs):
+        raise OSError(ctypes.get_last_error(), "Windows did not accept the desktop shortcut")
+
+
+def primary_work_area():
+    rect = Rect()
+    if windll.user32.SystemParametersInfoW(0x0030, 0, byref(rect), 0):
+        return rect.left, rect.top, rect.right, rect.bottom
+    return 0, 0, windll.user32.GetSystemMetrics(0), windll.user32.GetSystemMetrics(1) - 48
+
+
+def primary_taskbar_height():
+    _left, top, _right, bottom = primary_work_area()
+    screen_height = windll.user32.GetSystemMetrics(1)
+    bottom_height = max(0, screen_height - bottom)
+    top_height = max(0, top)
+    return max(40, bottom_height or top_height or 46)
+
+
+def primary_taskbar_geometry():
+    """Return the current primary taskbar height and the taskbar's top edge."""
+    _left, _top, _right, work_bottom = primary_work_area()
+    return primary_taskbar_height(), work_bottom
+
+
+def primary_screen_size():
+    """Return the primary screen dimensions in the same units used by Tk."""
+    return max(1, windll.user32.GetSystemMetrics(0)), max(1, windll.user32.GetSystemMetrics(1))
+
+
+def primary_start_button_left():
+    """Read the primary Windows taskbar Start button's current left edge."""
+    user32 = windll.user32
+    find_window = user32.FindWindowW
+    find_window.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    find_window.restype = wintypes.HWND
+    taskbar = find_window("Shell_TrayWnd", None)
+    if not taskbar:
+        return None
+
+    get_class = user32.GetClassNameW
+    get_class.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    get_class.restype = ctypes.c_int
+    get_rect = user32.GetWindowRect
+    get_rect.argtypes = [wintypes.HWND, POINTER(Rect)]
+    get_rect.restype = wintypes.BOOL
+    edges = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def visit(child, _data):
+        class_name = ctypes.create_unicode_buffer(96)
+        if get_class(child, class_name, len(class_name)) and class_name.value == "Start":
+            rect = Rect()
+            if get_rect(child, byref(rect)) and rect.right > rect.left:
+                edges.append(rect.left)
+        return True
+
+    enumerate_children = user32.EnumChildWindows
+    enumerate_children.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
+    enumerate_children.restype = wintypes.BOOL
+    enumerate_children(taskbar, visit, 0)
+    return min(edges) if edges else None

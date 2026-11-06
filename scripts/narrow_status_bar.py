@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import ctypes
 import os
 import queue
 import shutil
@@ -11,8 +10,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from ctypes import POINTER, Structure, byref, c_int, c_long, c_void_p, windll, wintypes
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from tkinter import font as tkfont
 
@@ -20,34 +18,34 @@ from api.claude_usage_api import ClaudeUsageClient
 from api.bluetooth_battery_api import read_connected_dji_mic_mini_2_battery
 from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
-from api.quota_format_api import earliest_future_expiry, reset_display_date, reset_display_time
+from api.quota_format_api import earliest_future_expiry, reset_display_date
 from api.quota_parse_api import parse_quota_payload
+from api.bar_layout_api import MIN_PREFERRED_BAR_WIDTH, column_layout, width_before_start_button
+from api.provider_snapshot_api import (
+    claude_snapshot as _claude_snapshot,
+    codex_snapshot as _codex_snapshot,
+    count_text as _count_text,
+    percent as _percent,
+    reset as _reset,
+    safe_failure as _safe_failure,
+)
 from api.win_shell_api import (
-    Rect,
-    SHELL_FLYOUT_CLASSES,
     WinEventHook,
+    primary_screen_size,
+    primary_start_button_left,
+    primary_taskbar_geometry,
+    send_control_number,
     set_window_topmost,
     toplevel_hwnd,
     window_needs_topmost,
 )
 from api.virtual_desktop_api import (
     DESKTOP_NAMES,
-    DESKTOP_NAME_ALIASES,
-    VIRTUAL_DESKTOPS_KEY,
     RegistryWatcher,
     read_active_virtual_desktop_name,
 )
 
 
-PREFERRED_BAR_WIDTH = 792
-MAX_PREFERRED_BAR_WIDTH = 900
-NAME_COLUMN_MAX = 88
-NAME_COLUMN_MIN = 50
-PRIMARY_COLUMN_WIDTH = 140
-WEEKLY_COLUMN_WIDTH = 170
-THIRD_COLUMN_WIDTH = 109
-DESKTOP_COLUMN_WIDTH = 72
-MIC_BATTERY_COLUMN_WIDTH = 69
 BG = "#101929"
 FG = "#EDF1F9"
 MUTED = "#97B1CC"
@@ -75,157 +73,6 @@ DESKTOP_POLL_FALLBACK_MS = 1000  # only used when the registry watcher cannot st
 DESKTOP_SAFETY_POLL_MS = 30 * 1000  # backstop while the watcher is active
 MIC_BATTERY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
-MIN_PREFERRED_BAR_WIDTH = 180
-
-
-INPUT_KEYBOARD = 1
-KEYEVENTF_KEYUP = 0x0002
-VK_CONTROL = 0x11
-KEYBOARD_UNION_SIZE = 32 if ctypes.sizeof(c_void_p) == 8 else 24
-
-
-class KeyboardInput(Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.WPARAM),
-    ]
-
-
-class InputUnion(ctypes.Union):
-    _fields_ = [
-        ("ki", KeyboardInput),
-        ("padding", ctypes.c_byte * KEYBOARD_UNION_SIZE),
-    ]
-
-
-class Input(Structure):
-    _anonymous_ = ("data",)
-    _fields_ = [("type", wintypes.DWORD), ("data", InputUnion)]
-
-
-def send_control_number(number):
-    if number not in (1, 2, 3):
-        raise ValueError("Unsupported desktop shortcut")
-    digit_vk = ord("0") + number
-    events = (
-        (VK_CONTROL, 0),
-        (digit_vk, 0),
-        (digit_vk, KEYEVENTF_KEYUP),
-        (VK_CONTROL, KEYEVENTF_KEYUP),
-    )
-    inputs = (Input * len(events))()
-    for item, (virtual_key, flags) in zip(inputs, events):
-        item.type = INPUT_KEYBOARD
-        item.ki = KeyboardInput(virtual_key, 0, flags, 0, 0)
-
-    send_input = windll.user32.SendInput
-    send_input.argtypes = [wintypes.UINT, POINTER(Input), c_int]
-    send_input.restype = wintypes.UINT
-    sent = send_input(len(inputs), inputs, ctypes.sizeof(Input))
-    if sent != len(inputs):
-        raise OSError(ctypes.get_last_error(), "Windows did not accept the desktop shortcut")
-
-
-def primary_work_area():
-    rect = Rect()
-    if windll.user32.SystemParametersInfoW(0x0030, 0, byref(rect), 0):
-        return rect.left, rect.top, rect.right, rect.bottom
-    return 0, 0, windll.user32.GetSystemMetrics(0), windll.user32.GetSystemMetrics(1) - 48
-
-
-def primary_taskbar_height():
-    _left, top, _right, bottom = primary_work_area()
-    screen_height = windll.user32.GetSystemMetrics(1)
-    bottom_height = max(0, screen_height - bottom)
-    top_height = max(0, top)
-    return max(40, bottom_height or top_height or 46)
-
-
-def primary_taskbar_geometry():
-    """Return the current primary taskbar height and the taskbar's top edge."""
-    _left, _top, _right, work_bottom = primary_work_area()
-    return primary_taskbar_height(), work_bottom
-
-
-def primary_screen_size():
-    """Return the primary screen dimensions in the same units used by Tk."""
-    return max(1, windll.user32.GetSystemMetrics(0)), max(1, windll.user32.GetSystemMetrics(1))
-
-
-def primary_start_button_left():
-    """Read the primary Windows taskbar Start button's current left edge."""
-    user32 = windll.user32
-    find_window = user32.FindWindowW
-    find_window.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-    find_window.restype = wintypes.HWND
-    taskbar = find_window("Shell_TrayWnd", None)
-    if not taskbar:
-        return None
-
-    get_class = user32.GetClassNameW
-    get_class.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    get_class.restype = ctypes.c_int
-    get_rect = user32.GetWindowRect
-    get_rect.argtypes = [wintypes.HWND, POINTER(Rect)]
-    get_rect.restype = wintypes.BOOL
-    edges = []
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @callback_type
-    def visit(child, _data):
-        class_name = ctypes.create_unicode_buffer(96)
-        if get_class(child, class_name, len(class_name)) and class_name.value == "Start":
-            rect = Rect()
-            if get_rect(child, byref(rect)) and rect.right > rect.left:
-                edges.append(rect.left)
-        return True
-
-    enumerate_children = user32.EnumChildWindows
-    enumerate_children.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
-    enumerate_children.restype = wintypes.BOOL
-    enumerate_children(taskbar, visit, 0)
-    return min(edges) if edges else None
-
-
-def width_before_start_button(x, start_left=None, gap=8):
-    """Cap the strip at the live Start button boundary, leaving a small gap."""
-    if start_left is None:
-        start_left = primary_start_button_left()
-    if start_left is None:
-        screen_width, _screen_height = primary_screen_size()
-        start_left = screen_width
-    return max(1, min(MAX_PREFERRED_BAR_WIDTH, int(start_left - int(x) - gap)))
-
-
-def column_layout(width):
-    """Fit quota, desktop and mic battery indicators into the available width."""
-    width = max(1, min(MAX_PREFERRED_BAR_WIDTH, int(width)))
-    name = min(NAME_COLUMN_MAX, width)
-    name_floor = min(NAME_COLUMN_MIN, width)
-    name -= min(max(0, name - name_floor), max(0, PREFERRED_BAR_WIDTH - width))
-    remaining = max(0, width - name)
-
-    preferred = (
-        PRIMARY_COLUMN_WIDTH,
-        WEEKLY_COLUMN_WIDTH,
-        THIRD_COLUMN_WIDTH,
-        MIC_BATTERY_COLUMN_WIDTH,
-        DESKTOP_COLUMN_WIDTH,
-        DESKTOP_COLUMN_WIDTH,
-        DESKTOP_COLUMN_WIDTH,
-    )
-    preferred_total = sum(preferred)
-    columns = [remaining * value // preferred_total for value in preferred]
-    for index in range(remaining - sum(columns)):
-        columns[index] += 1
-
-    edges = [0, name]
-    for column_width in columns:
-        edges.append(edges[-1] + column_width)
-    return tuple(edges)
 
 
 def fit_text(text, font, width):
@@ -265,108 +112,6 @@ def save_settings(value):
         )
     except OSError:
         pass
-
-
-def _epoch(value):
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-        except (ValueError, OverflowError, OSError):
-            return None
-    return None
-
-
-def _safe_window(window):
-    if not isinstance(window, dict):
-        return None
-    used = window.get("usedPercent")
-    remaining = None
-    if isinstance(used, (int, float)) and not isinstance(used, bool):
-        remaining = max(0, min(100, round(100 - float(used))))
-    raw_reset = _epoch(window.get("resetsAt"))
-    if remaining is None and raw_reset is None:
-        return None
-    return {"remainingPercent": remaining, "resetsAt": raw_reset}
-
-
-def _codex_snapshot(parsed):
-    limits = parsed.get("rateLimits", {})
-    primary = _safe_window(limits.get("primary"))
-    weekly = _safe_window(limits.get("secondary"))
-    if primary is None and weekly is None:
-        raise ValueError("No Codex quota windows")
-    credits = parsed.get("rateLimitResetCredits", {})
-    count = credits.get("availableCount")
-    if not isinstance(count, int) or isinstance(count, bool):
-        count = None
-    expiry = earliest_future_expiry(credits.get("resetsAt"))
-    return {
-        "primary": primary,
-        "weekly": weekly,
-        "resetCount": count,
-        "resetAt": expiry,
-    }
-
-
-def _claude_snapshot(parsed):
-    def clean(value):
-        if not isinstance(value, dict):
-            return None
-        remaining = value.get("remainingPercent")
-        if not isinstance(remaining, int) or isinstance(remaining, bool):
-            return None
-        reset = _epoch(value.get("resetsAt"))
-        return {
-            "remainingPercent": max(0, min(100, remaining)),
-            "resetsAt": reset,
-        }
-
-    models = {}
-    for name, value in parsed.get("models", {}).items():
-        if name not in {"Sonnet", "Opus"}:
-            continue
-        model = clean(value)
-        if model:
-            models[name] = model
-    primary = clean(parsed.get("primary"))
-    weekly = clean(parsed.get("weekly"))
-    if primary is None and weekly is None and not models:
-        raise ValueError("No Claude quota windows")
-    return {"primary": primary, "weekly": weekly, "models": models}
-
-
-def _percent(value):
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return "—"
-    return f"{max(0, min(100, round(value)))}%"
-
-
-def _reset(value):
-    return reset_display_time(value) if value is not None else "—"
-
-
-def _safe_failure(provider, error):
-    if isinstance(error, TimeoutError):
-        return "query timed out"
-    if isinstance(error, FileNotFoundError):
-        return "CLI not found"
-    if isinstance(error, PermissionError):
-        return "process could not start"
-    if isinstance(error, ValueError):
-        return "no quota fields returned"
-    if isinstance(error, RuntimeError):
-        message = str(error)
-        if "status " in message:
-            suffix = message.rsplit("status ", 1)[-1]
-            if suffix.isdigit():
-                return f"CLI exited ({suffix})"
-        return "local quota service unavailable"
-    return f"request failed ({type(error).__name__})"
 
 
 def _startup_shortcut_path():
@@ -1442,10 +1187,6 @@ class NarrowBar(tk.Tk):
         except Exception as error:
             log_exception("stopping local Codex app-server failed", error)
         self.destroy()
-
-
-def _count_text(value):
-    return str(value) if isinstance(value, int) and not isinstance(value, bool) else "—"
 
 
 def run():
