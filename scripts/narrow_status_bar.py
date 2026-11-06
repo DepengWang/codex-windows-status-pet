@@ -21,7 +21,13 @@ from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
 from api.quota_format_api import earliest_future_expiry, reset_display_date
 from api.quota_parse_api import parse_quota_payload
-from api.bar_layout_api import MIN_PREFERRED_BAR_WIDTH, column_layout, width_before_start_button
+from api.bar_layout_api import (
+    CAPSULE,
+    MIN_PREFERRED_BAR_WIDTH,
+    column_layout,
+    layout_mode,
+    width_before_start_button,
+)
 from api.provider_snapshot_api import (
     claude_snapshot as _claude_snapshot,
     codex_snapshot as _codex_snapshot,
@@ -331,17 +337,20 @@ class NarrowBar(tk.Tk):
                     fill=CODEX_NAME if row == 0 else CLAUDE_NAME,
                     outline="",
                 )
-                c.create_rectangle(
-                    edges[2],
-                    y1 + (1 if row == 0 else 0),
-                    edges[3],
-                    y2,
-                    fill=CODEX_THIRD if row == 0 else CLAUDE_THIRD,
-                    outline="",
-                )
+                if edges[3] > edges[2]:
+                    c.create_rectangle(
+                        edges[2],
+                        y1 + (1 if row == 0 else 0),
+                        edges[3],
+                        y2,
+                        fill=CODEX_THIRD if row == 0 else CLAUDE_THIRD,
+                        outline="",
+                    )
 
         for index, name in enumerate(DESKTOP_NAMES):
             left, right = edges[5 + index], edges[6 + index]
+            if right <= left:
+                continue
             c.create_rectangle(
                 left + 1,
                 1,
@@ -352,17 +361,21 @@ class NarrowBar(tk.Tk):
             )
 
         mic_left, mic_right = edges[4], edges[5]
-        c.create_rectangle(
-            mic_left + 1,
-            1,
-            mic_right - 1,
-            self.bar_height - 1,
-            fill=BG,
-            outline="",
-        )
+        if mic_right > mic_left:
+            c.create_rectangle(
+                mic_left + 1,
+                1,
+                mic_right - 1,
+                self.bar_height - 1,
+                fill=BG,
+                outline="",
+            )
 
         if self.background_visible:
-            for x in edges[1:-1]:
+            # Hidden columns collapse several edges onto one x; draw each divider once,
+            # and keep the last one inside the window so it closes the right side.
+            for x in sorted(set(edges[1:-1])):
+                x = min(x, width - 1)
                 c.create_line(x, 0, x, self.bar_height, fill=BORDER, width=1)
             c.create_line(0, mid, edges[5], mid, fill=BORDER, width=1)
             self._draw_outer_frame_to_data_end(edges[5])
@@ -376,6 +389,8 @@ class NarrowBar(tk.Tk):
         center_y = self.bar_height / 2
         for index, name in enumerate(DESKTOP_NAMES):
             left, right = edges[5 + index], edges[6 + index]
+            if right <= left:
+                continue
             center_x = (left + right) / 2
             self.canvas.create_text(
                 center_x,
@@ -388,6 +403,8 @@ class NarrowBar(tk.Tk):
 
     def _draw_mic_battery(self, edges):
         left, right = edges[4], edges[5]
+        if right <= left:
+            return
         battery = self.mic_battery
         devices = {item["label"]: item for item in battery["devices"]}
         self._draw_mic_battery_line(left, right, self.bar_height / 4, "GPT", devices.get("GPT"))
@@ -541,35 +558,24 @@ class NarrowBar(tk.Tk):
             third_bg = CLAUDE_THIRD
             name_bg = CLAUDE_NAME
         pad = min(10, max(5, round(self.bar_width * 0.01)))
+        capsule = layout_mode(self.bar_width) == CAPSULE
 
-        self._draw_segments(
-            edges[1] + pad,
-            y,
-            [
-                ("5h ", self.font_ui),
-                (_percent(primary.get("remainingPercent")), self.font_numbers),
-                (" / ", self.font_ui),
-                (_reset(primary.get("resetsAt")), self.font_numbers),
-            ],
-            edges[2] - edges[1] - 2 * pad,
-        )
-        self._draw_segments(
-            edges[2] + pad,
-            y,
-            [
-                ("WEEK ", self.font_ui),
-                (_percent(weekly.get("remainingPercent")), self.font_numbers),
-                (" / ", self.font_ui),
-                (_reset(weekly.get("resetsAt")), self.font_numbers),
-            ],
-            edges[3] - edges[2] - 2 * pad,
-        )
-        self._draw_segments(
-            edges[3] + pad,
-            y,
-            third_segments,
-            edges[4] - edges[3] - 2 * pad,
-        )
+        primary_segments = [
+            ("5h ", self.font_ui),
+            (_percent(primary.get("remainingPercent")), self.font_numbers),
+        ]
+        weekly_segments = [
+            ("W " if capsule else "WEEK ", self.font_ui),
+            (_percent(weekly.get("remainingPercent")), self.font_numbers),
+        ]
+        if not capsule:  # reset times need the room the capsule does not have
+            primary_segments += [(" / ", self.font_ui), (_reset(primary.get("resetsAt")), self.font_numbers)]
+            weekly_segments += [(" / ", self.font_ui), (_reset(weekly.get("resetsAt")), self.font_numbers)]
+
+        self._draw_segments(edges[1] + pad, y, primary_segments, edges[2] - edges[1] - 2 * pad)
+        self._draw_segments(edges[2] + pad, y, weekly_segments, edges[3] - edges[2] - 2 * pad)
+        if edges[4] > edges[3]:
+            self._draw_segments(edges[3] + pad, y, third_segments, edges[4] - edges[3] - 2 * pad)
 
     def _provider_detail_lines(self, name):
         state = self.providers[name]
