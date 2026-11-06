@@ -1,71 +1,162 @@
-"""Read the connected DJI Mic Mini 2 battery from Windows PnP properties."""
+"""Read the connected DJI Mic Mini 2 battery from Windows PnP properties.
+
+Uses CfgMgr32 in-process (no PowerShell child process); one read takes
+milliseconds instead of seconds of process start-up and PnP enumeration.
+"""
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
-from pathlib import Path
+import ctypes
+import re
+import sys
+import uuid
+from ctypes import wintypes
 
 
-_POWERSHELL_QUERY = r"""
-$ErrorActionPreference = 'Stop'
-try {
-    $deviceLabels = @{
-        '6F775D' = 'GPT'
-        '6F3291' = 'CC'
-    }
-    $audioEndpoints = @(Get-PnpDevice -Class AudioEndpoint -PresentOnly |
-        Where-Object { $_.FriendlyName -like '*DJI Mic Mini 2*Hands-Free*' })
-    # Keep a row for each known transmitter so the overlay can distinguish an
-    # offline device from a missing reading without showing cached battery data.
-    $readings = @(
-        [pscustomobject]@{ label = 'CC'; connected = $false; level = $null },
-        [pscustomobject]@{ label = 'GPT'; connected = $false; level = $null }
+# Last six hex digits of the transmitter's Bluetooth address -> display label.
+DEVICE_LABELS = {"6F775D": "GPT", "6F3291": "CC"}
+_NODE_NAME = re.compile(r"^DJI Mic Mini 2-([0-9A-F]{6}) Hands-Free AG$")
+_ENDPOINT_NAME = re.compile(r"\(DJI Mic Mini 2-([0-9A-F]{6}) Hands-Free\)")
+
+_CLASS_SYSTEM = "{4D36E97D-E325-11CE-BFC1-08002BE10318}"
+_CLASS_AUDIO_ENDPOINT = "{C166523C-FE0C-4A94-A586-F1A80CFBBF3E}"
+_CM_GETIDLIST_FILTER_PRESENT = 0x00000100
+_CM_GETIDLIST_FILTER_CLASS = 0x00000200
+_CR_SUCCESS = 0
+_DEVPROP_TYPE_BYTE = 0x03
+_DEVPROP_TYPE_STRING = 0x12
+
+
+class _Guid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _DevPropKey(ctypes.Structure):
+    _fields_ = [("fmtid", _Guid), ("pid", wintypes.ULONG)]
+
+
+def _devpropkey(guid, pid):
+    raw = uuid.UUID(guid)
+    fmtid = _Guid(
+        raw.time_low, raw.time_mid, raw.time_hi_version, (ctypes.c_ubyte * 8)(*raw.bytes[8:])
     )
-    $batteryNodes = @(Get-PnpDevice -Class System -PresentOnly |
-        Where-Object { $_.FriendlyName -match '^DJI Mic Mini 2-[0-9A-F]{6} Hands-Free AG$' })
+    return _DevPropKey(fmtid, pid)
 
-    foreach ($node in $batteryNodes) {
-        $match = [regex]::Match($node.FriendlyName, '^DJI Mic Mini 2-([0-9A-F]{6}) Hands-Free AG$')
-        $suffix = $match.Groups[1].Value.ToUpperInvariant()
-        $label = $deviceLabels[$suffix]
-        if (-not $label) {
+
+_cfgmgr = None
+_KEY_FRIENDLY_NAME = None
+_KEY_BATTERY_LEVEL = None
+
+
+def _api():
+    global _cfgmgr, _KEY_FRIENDLY_NAME, _KEY_BATTERY_LEVEL
+    if _cfgmgr is None:
+        if sys.platform != "win32":
+            raise RuntimeError("Windows PnP properties are unavailable on this platform")
+        lib = ctypes.WinDLL("cfgmgr32", use_last_error=True)
+        lib.CM_Get_Device_ID_List_SizeW.argtypes = [
+            ctypes.POINTER(wintypes.ULONG), wintypes.LPCWSTR, wintypes.ULONG,
+        ]
+        lib.CM_Get_Device_ID_List_SizeW.restype = wintypes.DWORD
+        lib.CM_Get_Device_ID_ListW.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG,
+        ]
+        lib.CM_Get_Device_ID_ListW.restype = wintypes.DWORD
+        lib.CM_Locate_DevNodeW.argtypes = [
+            ctypes.POINTER(wintypes.DWORD), wintypes.LPCWSTR, wintypes.ULONG,
+        ]
+        lib.CM_Locate_DevNodeW.restype = wintypes.DWORD
+        lib.CM_Get_DevNode_PropertyW.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(_DevPropKey),
+            ctypes.POINTER(wintypes.ULONG),
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.ULONG),
+            wintypes.ULONG,
+        ]
+        lib.CM_Get_DevNode_PropertyW.restype = wintypes.DWORD
+        _KEY_FRIENDLY_NAME = _devpropkey("A45C254E-DF1C-4EFD-8020-67D146A850E0", 14)
+        _KEY_BATTERY_LEVEL = _devpropkey("104EA319-6EE2-4701-BD47-8DDBF425BBE5", 2)
+        _cfgmgr = lib
+    return _cfgmgr
+
+
+def _present_instance_ids(class_guid):
+    lib = _api()
+    flags = _CM_GETIDLIST_FILTER_CLASS | _CM_GETIDLIST_FILTER_PRESENT
+    for _ in range(3):  # the list can grow between the size and read calls
+        size = wintypes.ULONG(0)
+        if lib.CM_Get_Device_ID_List_SizeW(ctypes.byref(size), class_guid, flags) != _CR_SUCCESS:
+            raise RuntimeError("Windows could not size the device list")
+        buffer = ctypes.create_unicode_buffer(size.value + 2)
+        if lib.CM_Get_Device_ID_ListW(class_guid, buffer, size.value, flags) == _CR_SUCCESS:
+            return [item for item in ctypes.wstring_at(buffer, size.value).split("\0") if item]
+    raise RuntimeError("Windows could not enumerate devices")
+
+
+def _property(instance_id, key, expected_type):
+    """Return the raw property bytes, or None when the device lacks the property."""
+    lib = _api()
+    devinst = wintypes.DWORD()
+    if lib.CM_Locate_DevNodeW(ctypes.byref(devinst), instance_id, 0) != _CR_SUCCESS:
+        return None
+    prop_type = wintypes.ULONG()
+    size = wintypes.ULONG(0)
+    lib.CM_Get_DevNode_PropertyW(
+        devinst, ctypes.byref(key), ctypes.byref(prop_type), None, ctypes.byref(size), 0
+    )
+    if not size.value:
+        return None
+    buffer = ctypes.create_string_buffer(size.value)
+    status = lib.CM_Get_DevNode_PropertyW(
+        devinst, ctypes.byref(key), ctypes.byref(prop_type), buffer, ctypes.byref(size), 0
+    )
+    if status != _CR_SUCCESS or prop_type.value != expected_type:
+        return None
+    return buffer.raw[: size.value]
+
+
+def _friendly_name(instance_id):
+    raw = _property(instance_id, _KEY_FRIENDLY_NAME, _DEVPROP_TYPE_STRING)
+    return raw.decode("utf-16-le").rstrip("\0") if raw else ""
+
+
+def _payload_from_windows():
+    # Keep a row for each known transmitter so the overlay can tell an offline
+    # device from a missing reading without showing cached battery data.
+    readings = {label: {"label": label, "connected": False, "level": None} for label in ("CC", "GPT")}
+
+    # A live audio endpoint proves the transmitter is connected right now; a
+    # paired-but-away transmitter still exposes a cached battery property.
+    active = set()
+    for instance_id in _present_instance_ids(_CLASS_AUDIO_ENDPOINT):
+        match = _ENDPOINT_NAME.search(_friendly_name(instance_id))
+        if match:
+            active.add(match.group(1).upper())
+    if not active:
+        return {"connected": False, "devices": list(readings.values())}
+
+    for instance_id in _present_instance_ids(_CLASS_SYSTEM):
+        if "BTHENUM" not in instance_id.upper():
             continue
-        }
-        $deviceName = $node.FriendlyName -replace ' Hands-Free AG$', ''
-        $endpoint = $audioEndpoints | Where-Object {
-            $_.FriendlyName -like "*($deviceName Hands-Free)*"
-        } | Select-Object -First 1
-        if (-not $endpoint) {
+        match = _NODE_NAME.match(_friendly_name(instance_id))
+        if not match:
             continue
-        }
+        suffix = match.group(1).upper()
+        label = DEVICE_LABELS.get(suffix)
+        if label is None or suffix not in active:
+            continue
+        raw = _property(instance_id, _KEY_BATTERY_LEVEL, _DEVPROP_TYPE_BYTE)
+        level = raw[0] if raw and 0 <= raw[0] <= 100 else None
+        readings[label].update(connected=True, level=level)
 
-        $battery = Get-PnpDeviceProperty -InstanceId $node.InstanceId `
-            -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue
-        $level = $null
-        if ($battery -and $null -ne $battery.Data) {
-            $candidate = [int]$battery.Data
-            if ($candidate -ge 0 -and $candidate -le 100) {
-                $level = $candidate
-            }
-        }
-        $reading = $readings | Where-Object { $_.label -eq $label } | Select-Object -First 1
-        if ($reading) {
-            $reading.connected = $true
-            $reading.level = $level
-        }
-    }
-
-    [pscustomobject]@{
-        connected = (@($readings | Where-Object { $_.connected }).Count -gt 0)
-        devices = @($readings)
-    } | ConvertTo-Json -Depth 3 -Compress
-} catch {
-    exit 1
-}
-"""
+    devices = list(readings.values())
+    return {"connected": any(item["connected"] for item in devices), "devices": devices}
 
 
 def _validated_devices(payload):
@@ -104,7 +195,6 @@ def _display_choice(devices):
 
 
 def _reading_from_payload(payload):
-    connected = payload.get("connected") is True
     devices = _validated_devices(payload)
     label, level, selected = _display_choice(devices)
     return {
@@ -123,42 +213,4 @@ def read_connected_dji_mic_mini_2_battery():
     from a paired but disconnected transmitter from being shown as current.
     Both known transmitters are included so the UI can display an offline row.
     """
-    powershell = shutil.which("powershell.exe")
-    if powershell is None:
-        candidate = (
-            Path(os.environ.get("SystemRoot", r"C:\Windows"))
-            / "System32"
-            / "WindowsPowerShell"
-            / "v1.0"
-            / "powershell.exe"
-        )
-        if candidate.is_file():
-            powershell = str(candidate)
-        else:
-            raise RuntimeError("Windows PowerShell is unavailable")
-
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-    result = subprocess.run(
-        [powershell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", _POWERSHELL_QUERY],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-        check=False,
-        startupinfo=startupinfo,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        raise RuntimeError("Windows did not return the DJI Mic Mini 2 battery level")
-
-    try:
-        payload = json.loads(result.stdout.strip())
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Windows returned an unreadable battery result") from error
-    if not isinstance(payload, dict):
-        raise RuntimeError("Windows returned an invalid battery result")
-    return _reading_from_payload(payload)
+    return _reading_from_payload(_payload_from_windows())
