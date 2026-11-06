@@ -11,8 +11,6 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-import uuid
-import winreg
 from ctypes import POINTER, Structure, byref, c_int, c_long, c_void_p, windll, wintypes
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +22,13 @@ from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
 from api.quota_format_api import earliest_future_expiry, reset_display_date, reset_display_time
 from api.quota_parse_api import parse_quota_payload
+from api.virtual_desktop_api import (
+    DESKTOP_NAMES,
+    DESKTOP_NAME_ALIASES,
+    VIRTUAL_DESKTOPS_KEY,
+    RegistryWatcher,
+    read_active_virtual_desktop_name,
+)
 
 
 PREFERRED_BAR_WIDTH = 792
@@ -35,9 +40,6 @@ WEEKLY_COLUMN_WIDTH = 170
 THIRD_COLUMN_WIDTH = 109
 DESKTOP_COLUMN_WIDTH = 72
 MIC_BATTERY_COLUMN_WIDTH = 69
-DESKTOP_NAMES = ("主屏", "远程", "创作")
-DESKTOP_NAME_ALIASES = {"主屏": "主屏", "远程": "远程", "编程": "创作", "创作": "创作"}
-VIRTUAL_DESKTOPS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops"
 BG = "#101929"
 FG = "#EDF1F9"
 MUTED = "#97B1CC"
@@ -60,7 +62,8 @@ CLAUDE_REFRESH_INTERVAL_S = 20 * 60
 WAKE_CHECK_INTERVAL_MS = 30 * 1000
 TASKBAR_CHECK_INTERVAL_MS = 60 * 1000
 WINDOW_CHECK_INTERVAL_MS = 2 * 1000  # cheap GetWindow check; SetWindowPos only when covered
-DESKTOP_CHECK_INTERVAL_MS = 1000
+DESKTOP_POLL_FALLBACK_MS = 1000  # only used when the registry watcher cannot start
+DESKTOP_SAFETY_POLL_MS = 30 * 1000  # backstop while the watcher is active
 MIC_BATTERY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
 SHELL_FLYOUT_CLASSES = {"Windows.UI.Core.CoreWindow"}  # Start/Search flyouts only
@@ -195,32 +198,6 @@ def width_before_start_button(x, start_left=None, gap=8):
         screen_width, _screen_height = primary_screen_size()
         start_left = screen_width
     return max(1, min(MAX_PREFERRED_BAR_WIDTH, int(start_left - int(x) - gap)))
-
-
-def read_active_virtual_desktop_name():
-    """Map Explorer's current per-user virtual desktop ID to a display label."""
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, VIRTUAL_DESKTOPS_KEY) as key:
-            current_id_data, _ = winreg.QueryValueEx(key, "CurrentVirtualDesktop")
-            desktop_ids, _ = winreg.QueryValueEx(key, "VirtualDesktopIDs")
-            if not isinstance(current_id_data, (bytes, bytearray)) or len(current_id_data) != 16:
-                return None
-            if not isinstance(desktop_ids, (bytes, bytearray)) or len(desktop_ids) % 16:
-                return None
-
-            current_id = uuid.UUID(bytes_le=bytes(current_id_data))
-            active_ids = (
-                uuid.UUID(bytes_le=bytes(desktop_ids[offset:offset + 16]))
-                for offset in range(0, len(desktop_ids), 16)
-            )
-            if current_id not in active_ids:
-                return None
-
-            with winreg.OpenKey(key, f"Desktops\\{{{current_id}}}") as desktop_key:
-                desktop_name, _ = winreg.QueryValueEx(desktop_key, "Name")
-            return DESKTOP_NAME_ALIASES.get(str(desktop_name).strip())
-    except (OSError, TypeError, ValueError):
-        return None
 
 
 def column_layout(width):
@@ -571,6 +548,11 @@ class NarrowBar(tk.Tk):
             "active virtual desktop indicator initialized: %s",
             self.active_desktop_name or "unavailable",
         )
+        self.desktop_watcher = RegistryWatcher(self._desktop_signal)
+        self.desktop_poll_ms = (
+            DESKTOP_SAFETY_POLL_MS if self.desktop_watcher.start() else DESKTOP_POLL_FALLBACK_MS
+        )
+        LOGGER.info("virtual desktop change watcher active=%s", self.desktop_watcher.active)
 
         self.providers = {
             "Codex": {
@@ -619,7 +601,7 @@ class NarrowBar(tk.Tk):
         self.after(REFRESH_INTERVAL_MS, self.auto_refresh)
         self.after(WAKE_CHECK_INTERVAL_MS, self.check_wake)
         self.taskbar_alignment_job = self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
-        self.desktop_check_job = self.after(DESKTOP_CHECK_INTERVAL_MS, self.check_active_desktop)
+        self.desktop_check_job = self.after(self.desktop_poll_ms, self.check_active_desktop)
         self.mic_battery_job = self.after(250, self.refresh_mic_battery)
         self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
 
@@ -1298,7 +1280,14 @@ class NarrowBar(tk.Tk):
         self.reset_job = None
         self.refresh()
 
-    def check_active_desktop(self):
+    def _desktop_signal(self):
+        """Watcher thread wake-up: hop to the Tk thread and re-read the desktop."""
+        try:
+            self.after(0, self.refresh_active_desktop)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def refresh_active_desktop(self):
         if self.closed:
             return
         current = read_active_virtual_desktop_name()
@@ -1309,8 +1298,12 @@ class NarrowBar(tk.Tk):
                 current or "unavailable",
             )
             self.draw_bar()
-        if not self.closed:
-            self.desktop_check_job = self.after(DESKTOP_CHECK_INTERVAL_MS, self.check_active_desktop)
+
+    def check_active_desktop(self):
+        if self.closed:
+            return
+        self.refresh_active_desktop()
+        self.desktop_check_job = self.after(self.desktop_poll_ms, self.check_active_desktop)
 
     def refresh_mic_battery(self):
         if self.closed:
@@ -1479,6 +1472,10 @@ class NarrowBar(tk.Tk):
                 pass
             self.mic_battery_job = None
         self._hide_tooltip()
+        try:
+            self.desktop_watcher.stop()
+        except Exception as error:
+            log_exception("stopping virtual desktop watcher failed", error)
         try:
             self.server.stop()
         except Exception as error:
