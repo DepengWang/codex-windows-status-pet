@@ -56,12 +56,14 @@ DOT_OFFLINE = "#EFB86B"
 SETTINGS_PATH = Path(__file__).resolve().parents[1] / "narrow-status-bar.json"
 DEFAULT_X, DEFAULT_Y = -4, -48
 REFRESH_INTERVAL_MS = 5 * 60 * 1000
+CLAUDE_REFRESH_INTERVAL_S = 20 * 60
 WAKE_CHECK_INTERVAL_MS = 30 * 1000
 TASKBAR_CHECK_INTERVAL_MS = 60 * 1000
-WINDOW_CHECK_INTERVAL_MS = 5 * 1000
+WINDOW_CHECK_INTERVAL_MS = 2 * 1000  # cheap GetWindow check; SetWindowPos only when covered
 DESKTOP_CHECK_INTERVAL_MS = 1000
-MIC_BATTERY_REFRESH_INTERVAL_MS = 30 * 1000
+MIC_BATTERY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
+SHELL_FLYOUT_CLASSES = {"Windows.UI.Core.CoreWindow"}  # Start/Search flyouts only
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
@@ -265,6 +267,53 @@ def set_window_topmost(hwnd):
     set_pos.restype = wintypes.BOOL
     flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
     return bool(set_pos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags))
+
+
+def toplevel_hwnd(widget_id):
+    """Tk's winfo_id() is the inner child; z-order lives on its parent frame."""
+    user32 = windll.user32
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+    return user32.GetParent(widget_id) or widget_id
+
+
+def window_needs_topmost(hwnd):
+    """True when a visible window covers ours and no Start/Search flyout is active.
+
+    Re-asserting HWND_TOPMOST unconditionally fights Start/Search flyouts for z-order.
+    Invisible topmost helpers (IME etc.) always sit above us and are ignored.
+    """
+    user32 = windll.user32
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, POINTER(Rect)]
+    covered = False
+    above = user32.GetWindow(hwnd, 3)  # GW_HWNDPREV
+    for _ in range(64):
+        if not above:
+            break
+        rect = Rect()
+        if (
+            user32.IsWindowVisible(above)
+            and user32.GetWindowRect(above, byref(rect))
+            and rect.right > rect.left
+            and rect.bottom > rect.top
+        ):
+            covered = True
+            break
+        above = user32.GetWindow(above, 3)
+    if not covered:
+        return False
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    foreground = user32.GetForegroundWindow()
+    if foreground:
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, c_int]
+        buffer = ctypes.create_unicode_buffer(96)
+        user32.GetClassNameW(foreground, buffer, len(buffer))
+        if buffer.value in SHELL_FLYOUT_CLASSES:
+            return False
+    return True
 
 
 def fit_text(text, font, width):
@@ -1132,6 +1181,7 @@ class NarrowBar(tk.Tk):
         self.last_action_error = None
         self._start_provider_read("Codex", self._read_codex)
         self._start_provider_read("Claude", self._read_claude)
+        self.last_claude_refresh = time.monotonic()
 
     def _read_codex(self):
         try:
@@ -1196,7 +1246,13 @@ class NarrowBar(tk.Tk):
 
     def auto_refresh(self):
         if not self.closed:
-            self.refresh()
+            claude_due = (
+                time.monotonic() - getattr(self, "last_claude_refresh", 0) >= CLAUDE_REFRESH_INTERVAL_S - 5
+            )
+            if claude_due:
+                self.refresh()
+            else:
+                self._start_provider_read("Codex", self._read_codex)
             self.after(REFRESH_INTERVAL_MS, self.auto_refresh)
 
     def check_wake(self):
@@ -1380,9 +1436,11 @@ class NarrowBar(tk.Tk):
         try:
             if self.state() == "withdrawn":
                 self.deiconify()
-            self.attributes("-topmost", True)
+            hwnd = toplevel_hwnd(self.winfo_id())
+            if not window_needs_topmost(hwnd):
+                return
             try:
-                if not set_window_topmost(self.winfo_id()):
+                if not set_window_topmost(hwnd):
                     LOGGER.warning("SetWindowPos(HWND_TOPMOST) did not succeed")
             except Exception as error:
                 log_exception("SetWindowPos(HWND_TOPMOST) failed", error)
