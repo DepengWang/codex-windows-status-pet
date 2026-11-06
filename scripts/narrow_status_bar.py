@@ -19,6 +19,7 @@ from pathlib import Path
 from tkinter import font as tkfont
 
 from api.claude_usage_api import ClaudeUsageClient
+from api.bluetooth_battery_api import read_connected_dji_mic_mini_2_battery
 from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
 from api.quota_format_api import earliest_future_expiry, reset_display_date, reset_display_time
@@ -26,12 +27,13 @@ from api.quota_parse_api import parse_quota_payload
 
 
 PREFERRED_BAR_WIDTH = 792
-NAME_COLUMN_MAX = 120
-NAME_COLUMN_MIN = 58
-PRIMARY_COLUMN_WIDTH = 110
-WEEKLY_COLUMN_WIDTH = 172
-THIRD_COLUMN_WIDTH = 120
-DESKTOP_COLUMN_WIDTH = 90
+NAME_COLUMN_MAX = 88
+NAME_COLUMN_MIN = 50
+PRIMARY_COLUMN_WIDTH = 140
+WEEKLY_COLUMN_WIDTH = 170
+THIRD_COLUMN_WIDTH = 109
+DESKTOP_COLUMN_WIDTH = 72
+MIC_BATTERY_COLUMN_WIDTH = 69
 DESKTOP_NAMES = ("主屏", "远程", "创作")
 DESKTOP_NAME_ALIASES = {"主屏": "主屏", "远程": "远程", "编程": "创作", "创作": "创作"}
 VIRTUAL_DESKTOPS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops"
@@ -39,11 +41,11 @@ BG = "#101929"
 FG = "#EDF1F9"
 MUTED = "#97B1CC"
 BORDER = "#4A5A66"
-DESKTOP_ACTIVE_BG = "#5C9E6F"
 DESKTOP_INACTIVE_BG = "#34404B"
 DESKTOP_TEXT = "#FFFFFF"
 TRANSPARENT = "#010203"
 CODEX_NAME = "#C61862"
+DESKTOP_ACTIVE_BG = CODEX_NAME
 CODEX_THIRD = "#205B4E"
 CLAUDE_NAME = "#B4532A"
 CLAUDE_THIRD = "#2E4E7A"
@@ -57,6 +59,7 @@ WAKE_CHECK_INTERVAL_MS = 30 * 1000
 TASKBAR_CHECK_INTERVAL_MS = 60 * 1000
 WINDOW_CHECK_INTERVAL_MS = 5 * 1000
 DESKTOP_CHECK_INTERVAL_MS = 1000
+MIC_BATTERY_REFRESH_INTERVAL_MS = 30 * 1000
 
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
@@ -218,7 +221,7 @@ def read_active_virtual_desktop_name():
 
 
 def column_layout(width):
-    """Fit quota and desktop indicators, shrinking the provider-name column first."""
+    """Fit quota, desktop and mic battery indicators into the available width."""
     width = max(1, min(PREFERRED_BAR_WIDTH, int(width)))
     name = min(NAME_COLUMN_MAX, width)
     name_floor = min(NAME_COLUMN_MIN, width)
@@ -229,6 +232,7 @@ def column_layout(width):
         PRIMARY_COLUMN_WIDTH,
         WEEKLY_COLUMN_WIDTH,
         THIRD_COLUMN_WIDTH,
+        MIC_BATTERY_COLUMN_WIDTH,
         DESKTOP_COLUMN_WIDTH,
         DESKTOP_COLUMN_WIDTH,
         DESKTOP_COLUMN_WIDTH,
@@ -474,6 +478,7 @@ class NarrowBar(tk.Tk):
         )
         self.taskbar_alignment_job = None
         self.desktop_check_job = None
+        self.mic_battery_job = None
         if self.start_boundary_unavailable:
             LOGGER.warning("Start button boundary unavailable; using primary screen edge as width limit")
         self.title("Codex and Claude Usage")
@@ -501,6 +506,16 @@ class NarrowBar(tk.Tk):
         self.last_wake_wall = time.time()
         self.last_wake_mono = time.monotonic()
         self.last_action_error = None
+        self.mic_battery_fetching = False
+        self.mic_battery = {
+            "connected": False,
+            "label": "MIC",
+            "level": None,
+            "selected": None,
+            "devices": [],
+            "updated_at": None,
+            "error": None,
+        }
         self.active_desktop_name = read_active_virtual_desktop_name()
         LOGGER.info(
             "active virtual desktop indicator initialized: %s",
@@ -555,6 +570,7 @@ class NarrowBar(tk.Tk):
         self.after(WAKE_CHECK_INTERVAL_MS, self.check_wake)
         self.taskbar_alignment_job = self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
         self.desktop_check_job = self.after(DESKTOP_CHECK_INTERVAL_MS, self.check_active_desktop)
+        self.mic_battery_job = self.after(250, self.refresh_mic_battery)
         self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
 
     def apply_transparency(self):
@@ -598,7 +614,7 @@ class NarrowBar(tk.Tk):
                 )
 
         for index, name in enumerate(DESKTOP_NAMES):
-            left, right = edges[4 + index], edges[5 + index]
+            left, right = edges[5 + index], edges[6 + index]
             c.create_rectangle(
                 left + 1,
                 1,
@@ -608,20 +624,31 @@ class NarrowBar(tk.Tk):
                 outline="",
             )
 
+        mic_left, mic_right = edges[4], edges[5]
+        c.create_rectangle(
+            mic_left + 1,
+            1,
+            mic_right - 1,
+            self.bar_height - 1,
+            fill=BG,
+            outline="",
+        )
+
         if self.background_visible:
             for x in edges[1:-1]:
                 c.create_line(x, 0, x, self.bar_height, fill=BORDER, width=1)
-            c.create_line(0, mid, edges[4], mid, fill=BORDER, width=1)
-            self._draw_outer_frame_to_data_end(edges[4])
+            c.create_line(0, mid, edges[5], mid, fill=BORDER, width=1)
+            self._draw_outer_frame_to_data_end(edges[5])
 
         self._draw_provider("Codex", 0, row_centres[0])
         self._draw_provider("Claude", 1, row_centres[1])
         self._draw_desktop_indicators(edges)
+        self._draw_mic_battery(edges)
 
     def _draw_desktop_indicators(self, edges):
         center_y = self.bar_height / 2
         for index, name in enumerate(DESKTOP_NAMES):
-            left, right = edges[4 + index], edges[5 + index]
+            left, right = edges[5 + index], edges[6 + index]
             center_x = (left + right) / 2
             self.canvas.create_text(
                 center_x,
@@ -631,6 +658,42 @@ class NarrowBar(tk.Tk):
                 fill=DESKTOP_TEXT,
                 font=self.font_desktop,
             )
+
+    def _draw_mic_battery(self, edges):
+        left, right = edges[4], edges[5]
+        battery = self.mic_battery
+        devices = {item["label"]: item for item in battery["devices"]}
+        self._draw_mic_battery_line(left, right, self.bar_height / 4, "GPT", devices.get("GPT"))
+        self._draw_mic_battery_line(left, right, self.bar_height * 3 / 4, "CC", devices.get("CC"))
+
+    def _draw_mic_battery_line(self, left, right, y, label, device):
+        level = device["level"] if device else None
+        online = bool(device and device.get("connected"))
+        value = f"{level}%" if isinstance(level, int) and not isinstance(level, bool) else "--"
+        color = FG if online else "#8A93A2"
+        segments = [(f"{label} ", self.font_ui), (value, self.font_numbers)]
+
+        available = max(0, right - left - 8)
+        total_width = sum(font.measure(text) for text, font in segments)
+        if total_width > available:
+            self.canvas.create_text(
+                (left + right) / 2,
+                y,
+                anchor="center",
+                text=fit_text(
+                    f"{label} {value}",
+                    self.font_ui,
+                    available,
+                ),
+                fill=color,
+                font=self.font_ui,
+            )
+            return
+
+        x = (left + right - total_width) / 2
+        for text, font in segments:
+            self.canvas.create_text(x, y, anchor="w", text=text, fill=color, font=font)
+            x += font.measure(text)
 
     def _draw_outer_frame_to_data_end(self, content_right):
         c = self.canvas
@@ -750,7 +813,7 @@ class NarrowBar(tk.Tk):
                 third_segments = [("—", self.font_numbers)]
             third_bg = CLAUDE_THIRD
             name_bg = CLAUDE_NAME
-        pad = min(12, max(5, round(self.bar_width * 0.012)))
+        pad = min(10, max(5, round(self.bar_width * 0.01)))
 
         self._draw_segments(
             edges[1] + pad,
@@ -817,7 +880,52 @@ class NarrowBar(tk.Tk):
         return lines
 
     def _all_details(self):
-        return self._provider_detail_lines("Codex") + [""] + self._provider_detail_lines("Claude")
+        return (
+            self._provider_detail_lines("Codex")
+            + [""]
+            + self._provider_detail_lines("Claude")
+            + [""]
+            + self._mic_battery_detail_lines()
+        )
+
+    def _mic_battery_detail_lines(self):
+        battery = self.mic_battery
+        connected = battery["connected"]
+        level = battery["level"] if connected else None
+        state = "Unavailable" if battery["error"] else ("Connected" if connected else "Not connected")
+        level_text = f"{level}%" if isinstance(level, int) and not isinstance(level, bool) else "—"
+        updated = battery["updated_at"]
+        devices = {item["label"]: item for item in battery["devices"]}
+        displayed = "; ".join(
+            f"{label} {devices[label]['level']}%"
+            if devices.get(label, {}).get("connected") and isinstance(devices[label].get("level"), int)
+            else f"{label} --"
+            for label in ("GPT", "CC")
+        )
+        lowest = (
+            f"{battery['selected']} {level_text}"
+            if battery["selected"] and level is not None
+            else "—"
+        )
+        lines = [
+            f"DJI Mic Mini 2 — {state}",
+            f"Displayed: {displayed}",
+            f"Lowest connected device: {lowest}",
+            "Last checked: " + (datetime.fromtimestamp(updated).astimezone().strftime("%Y-%m-%d %H:%M:%S") if updated else "—"),
+            "Source: Windows Bluetooth HFP device battery property",
+        ]
+        for label in ("GPT", "CC"):
+            device = next((item for item in battery["devices"] if item["label"] == label), None)
+            device_level = device["level"] if device else None
+            device_text = (
+                f"{device_level}%"
+                if device and device.get("connected") and isinstance(device_level, int)
+                else "--"
+            )
+            lines.append(f"{label}: {device_text}")
+        if battery["error"]:
+            lines.append("Failure: Windows battery property could not be read")
+        return lines
 
     def _show_tooltip(self):
         self.tooltip_job = None
@@ -930,7 +1038,7 @@ class NarrowBar(tk.Tk):
                 (
                     index
                     for index in range(len(DESKTOP_NAMES))
-                    if self.column_edges[4 + index] <= event.x < self.column_edges[5 + index]
+                    if self.column_edges[5 + index] <= event.x < self.column_edges[6 + index]
                 ),
                 None,
             )
@@ -956,6 +1064,10 @@ class NarrowBar(tk.Tk):
         menu.add_separator()
         menu.add_command(label="Claude details", state="disabled")
         for line in self._provider_detail_lines("Claude")[1:]:
+            menu.add_command(label="  " + line, state="disabled")
+        menu.add_separator()
+        menu.add_command(label="DJI Mic Mini 2", state="disabled")
+        for line in self._mic_battery_detail_lines()[1:]:
             menu.add_command(label="  " + line, state="disabled")
         menu.add_separator()
         menu.add_command(label="Refresh now", command=self.refresh)
@@ -1143,6 +1255,52 @@ class NarrowBar(tk.Tk):
         if not self.closed:
             self.desktop_check_job = self.after(DESKTOP_CHECK_INTERVAL_MS, self.check_active_desktop)
 
+    def refresh_mic_battery(self):
+        if self.closed:
+            return
+        self.mic_battery_job = self.after(
+            MIC_BATTERY_REFRESH_INTERVAL_MS,
+            self.refresh_mic_battery,
+        )
+        if self.mic_battery_fetching:
+            return
+        self.mic_battery_fetching = True
+        threading.Thread(
+            target=self._mic_battery_worker,
+            name="dji-mic-battery-read",
+            daemon=True,
+        ).start()
+
+    def _mic_battery_worker(self):
+        try:
+            reading = read_connected_dji_mic_mini_2_battery()
+            error = None
+        except Exception:
+            reading = {
+                "connected": False,
+                "label": "MIC",
+                "level": None,
+                "selected": None,
+                "devices": [],
+            }
+            error = "Windows battery property could not be read"
+            LOGGER.warning("DJI Mic Mini 2 battery property read failed")
+        try:
+            self.after(0, self._mic_battery_result, reading, error)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _mic_battery_result(self, reading, error):
+        if self.closed:
+            return
+        self.mic_battery_fetching = False
+        self.mic_battery = {
+            **reading,
+            "updated_at": time.time(),
+            "error": error,
+        }
+        self.draw_bar()
+
     def ensure_taskbar_alignment(self):
         if self.closed:
             return
@@ -1255,6 +1413,12 @@ class NarrowBar(tk.Tk):
             except tk.TclError:
                 pass
             self.desktop_check_job = None
+        if self.mic_battery_job is not None:
+            try:
+                self.after_cancel(self.mic_battery_job)
+            except tk.TclError:
+                pass
+            self.mic_battery_job = None
         self._hide_tooltip()
         try:
             self.server.stop()
