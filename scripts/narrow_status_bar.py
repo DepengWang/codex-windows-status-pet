@@ -15,6 +15,7 @@ from pathlib import Path
 from tkinter import font as tkfont
 
 from api.claude_usage_api import ClaudeUsageClient
+from api.debounce_api import Debouncer
 from api.bluetooth_battery_api import read_connected_dji_mic_mini_2_battery
 from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
@@ -30,6 +31,7 @@ from api.provider_snapshot_api import (
     safe_failure as _safe_failure,
 )
 from api.win_shell_api import (
+    TaskbarWatcher,
     WinEventHook,
     primary_screen_size,
     primary_start_button_left,
@@ -66,7 +68,10 @@ DEFAULT_X, DEFAULT_Y = -4, -48
 REFRESH_INTERVAL_MS = 5 * 60 * 1000
 CLAUDE_REFRESH_INTERVAL_S = 20 * 60
 WAKE_CHECK_INTERVAL_MS = 30 * 1000
-TASKBAR_CHECK_INTERVAL_MS = 60 * 1000
+TASKBAR_CHECK_INTERVAL_MS = 60 * 1000  # backstop while the taskbar watcher is active
+TASKBAR_POLL_FALLBACK_MS = 5 * 1000  # used only when the taskbar watcher cannot start
+GEOMETRY_EVENT_DEBOUNCE_MS = 400  # Explorer emits bursts of events while it re-lays out
+GEOMETRY_CONFIRM_MS = 1500  # one more pass after things settle
 WINDOW_CHECK_INTERVAL_MS = 15 * 1000  # backstop; WinEvent hook triggers the normal checks
 TOPMOST_EVENT_DEBOUNCE_MS = 150
 DESKTOP_POLL_FALLBACK_MS = 1000  # only used when the registry watcher cannot start
@@ -277,10 +282,17 @@ class NarrowBar(tk.Tk):
         self.canvas.bind("<Leave>", self.pointer_leave)
         self.protocol("WM_DELETE_WINDOW", self.close)
 
+        self.geometry_debounce = Debouncer(self.after, self.after_cancel, GEOMETRY_EVENT_DEBOUNCE_MS, self._geometry_settled)
+        self.geometry_confirm = Debouncer(self.after, self.after_cancel, GEOMETRY_CONFIRM_MS, self.apply_taskbar_alignment)
+        self.geometry_watcher = TaskbarWatcher(self._geometry_signal)
+        geometry_events = self.geometry_watcher.start()
+        self.taskbar_poll_ms = TASKBAR_CHECK_INTERVAL_MS if geometry_events else TASKBAR_POLL_FALLBACK_MS
+        LOGGER.info("taskbar geometry watcher active=%s", geometry_events)
+
         self.after(100, self.refresh)
         self.after(REFRESH_INTERVAL_MS, self.auto_refresh)
         self.after(WAKE_CHECK_INTERVAL_MS, self.check_wake)
-        self.taskbar_alignment_job = self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
+        self.taskbar_alignment_job = self.after(self.taskbar_poll_ms, self.ensure_taskbar_alignment)
         self.desktop_check_job = self.after(self.desktop_poll_ms, self.check_active_desktop)
         self.mic_battery_job = self.after(250, self.refresh_mic_battery)
         self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
@@ -1034,10 +1046,38 @@ class NarrowBar(tk.Tk):
         }
         self.draw_bar()
 
+    def _geometry_signal(self):
+        """Hook thread: only hand off to the Tk thread, never touch widgets here."""
+        try:
+            self.after(0, self.geometry_debounce.trigger)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _geometry_settled(self):
+        if self.closed:
+            return
+        self.apply_taskbar_alignment()
+        self.geometry_confirm.trigger()
+
     def ensure_taskbar_alignment(self):
+        """Slow backstop: also re-targets the watcher after an Explorer restart."""
         if self.closed:
             return
         self.taskbar_alignment_job = None
+        try:
+            self.geometry_watcher.retarget()
+        except Exception as error:
+            log_exception("taskbar watcher retarget failed", error)
+        self.taskbar_poll_ms = (
+            TASKBAR_CHECK_INTERVAL_MS if self.geometry_watcher.active else TASKBAR_POLL_FALLBACK_MS
+        )
+        self.apply_taskbar_alignment()
+        if not self.closed:
+            self.taskbar_alignment_job = self.after(self.taskbar_poll_ms, self.ensure_taskbar_alignment)
+
+    def apply_taskbar_alignment(self):
+        if self.closed:
+            return
         try:
             new_height, new_taskbar_y = primary_taskbar_geometry()
             new_screen_width, new_screen_height = primary_screen_size()
@@ -1084,8 +1124,9 @@ class NarrowBar(tk.Tk):
                 self.column_edges = column_layout(self.bar_width)
                 self.geometry(f"{self.bar_width}x{self.bar_height}+{current_x}+{self.taskbar_y}")
                 self.canvas.configure(width=self.bar_width, height=self.bar_height)
-                self.settings.update(x=current_x, y=self.taskbar_y)
-                save_settings(self.settings)
+                if (current_x, self.taskbar_y) != (self.settings.get("x"), self.settings.get("y")):
+                    self.settings.update(x=current_x, y=self.taskbar_y)
+                    save_settings(self.settings)
                 self.draw_bar()
                 LOGGER.info(
                     "overlay layout recalculated: screen=%sx%s taskbar=%sx%s x=%s start-left=%s width=%s columns=%s",
@@ -1103,8 +1144,6 @@ class NarrowBar(tk.Tk):
             self.screen_height = new_screen_height
         except tk.TclError as error:
             log_exception("taskbar alignment check failed", error)
-        if not self.closed:
-            self.taskbar_alignment_job = self.after(TASKBAR_CHECK_INTERVAL_MS, self.ensure_taskbar_alignment)
 
     def reassert_window_topmost(self):
         if self.closed:
@@ -1174,6 +1213,12 @@ class NarrowBar(tk.Tk):
                 pass
             self.mic_battery_job = None
         self._hide_tooltip()
+        self.geometry_debounce.cancel()
+        self.geometry_confirm.cancel()
+        try:
+            self.geometry_watcher.stop()
+        except Exception as error:
+            log_exception("stopping taskbar watcher failed", error)
         try:
             self.topmost_hook.stop()
         except Exception as error:

@@ -17,6 +17,8 @@ SWP_NOOWNERZORDER = 0x0200
 GW_HWNDPREV = 3
 
 EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+OBJID_WINDOW = 0
 EVENT_SYSTEM_MINIMIZESTART = 0x0016
 EVENT_SYSTEM_MINIMIZEEND = 0x0017
 WM_QUIT = 0x0012
@@ -119,13 +121,18 @@ class WinEventHook:
     (for example ``root.after(0, ...)``), never do real work.
     """
 
-    EVENT_RANGES = (
+    DEFAULT_RANGES = (
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
     )
 
-    def __init__(self, on_event):
+    def __init__(self, on_event, ranges=None, process_id=0, accept=None):
+        """ranges: (low, high) event pairs; process_id: 0 = all processes;
+        accept(hwnd, object_id) -> bool filters events before on_event."""
         self._on_event = on_event
+        self._ranges = tuple(ranges or self.DEFAULT_RANGES)
+        self._process_id = process_id
+        self._accept = accept
         self._thread = None
         self._thread_id = None
         self._ready = threading.Event()
@@ -137,8 +144,10 @@ class WinEventHook:
     def active(self):
         return self._installed
 
-    def _dispatch(self, _hook, _event, _hwnd, _object_id, _child_id, _thread, _time):
+    def _dispatch(self, _hook, _event, hwnd, object_id, _child_id, _thread, _time):
         try:
+            if self._accept is not None and not self._accept(hwnd, object_id):
+                return
             self._on_event()
         except Exception:
             pass
@@ -180,9 +189,9 @@ class WinEventHook:
         self._thread_id = kernel32.GetCurrentThreadId()
         handles = []
         try:
-            for low, high in self.EVENT_RANGES:
+            for low, high in self._ranges:
                 handle = user32.SetWinEventHook(
-                    low, high, None, self._callback, 0, 0,
+                    low, high, None, self._callback, self._process_id, 0,
                     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
                 )
                 if not handle:
@@ -285,15 +294,19 @@ def primary_screen_size():
     return max(1, windll.user32.GetSystemMetrics(0)), max(1, windll.user32.GetSystemMetrics(1))
 
 
-def primary_start_button_left():
-    """Read the primary Windows taskbar Start button's current left edge."""
+def find_taskbar_start():
+    """Return (taskbar_hwnd, start_hwnd, start_left) for the primary taskbar.
+
+    start_hwnd/start_left are None when the Start button window is not found
+    (Explorer restarting, taskbar hidden, ...); taskbar_hwnd is None then too.
+    """
     user32 = windll.user32
     find_window = user32.FindWindowW
     find_window.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
     find_window.restype = wintypes.HWND
     taskbar = find_window("Shell_TrayWnd", None)
     if not taskbar:
-        return None
+        return None, None, None
 
     get_class = user32.GetClassNameW
     get_class.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -301,7 +314,7 @@ def primary_start_button_left():
     get_rect = user32.GetWindowRect
     get_rect.argtypes = [wintypes.HWND, POINTER(Rect)]
     get_rect.restype = wintypes.BOOL
-    edges = []
+    found = []
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     @callback_type
@@ -310,11 +323,86 @@ def primary_start_button_left():
         if get_class(child, class_name, len(class_name)) and class_name.value == "Start":
             rect = Rect()
             if get_rect(child, byref(rect)) and rect.right > rect.left:
-                edges.append(rect.left)
+                found.append((rect.left, child))
         return True
 
     enumerate_children = user32.EnumChildWindows
     enumerate_children.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
     enumerate_children.restype = wintypes.BOOL
     enumerate_children(taskbar, visit, 0)
-    return min(edges) if edges else None
+    if not found:
+        return taskbar, None, None
+    left, start = min(found, key=lambda item: item[0])
+    return taskbar, start, left
+
+
+def primary_start_button_left():
+    """Read the primary Windows taskbar Start button's current left edge."""
+    return find_taskbar_start()[2]
+
+
+class TaskbarWatcher:
+    """Call on_change() when the taskbar or its Start button moves or resizes.
+
+    Covers display/resolution/work-area changes (the taskbar is re-laid out) and
+    icons being added or removed (the Start button shifts). Events arrive in
+    bursts while Explorer settles, so callers must debounce. on_change runs on
+    the hook thread and must only hand off to the UI thread.
+
+    The hook is scoped to the Explorer process and filtered to two window
+    handles, so unrelated shell activity costs almost nothing. retarget() must be
+    called occasionally (a slow poll) because Explorer restarts change both
+    handles; it re-installs the hook only when they changed.
+    """
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+        self._hook = None
+        self._targets = frozenset()
+        self._signature = None
+
+    @property
+    def active(self):
+        return bool(self._hook and self._hook.active)
+
+    def _accept(self, hwnd, object_id):
+        return object_id == OBJID_WINDOW and hwnd in self._targets
+
+    @staticmethod
+    def _lookup():
+        taskbar, start, _left = find_taskbar_start()
+        if not taskbar:
+            return None
+        pid = wintypes.DWORD()
+        windll.user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, POINTER(wintypes.DWORD)]
+        windll.user32.GetWindowThreadProcessId(taskbar, byref(pid))
+        return taskbar, start, pid.value
+
+    def start(self):
+        """Install the hook; returns True when active."""
+        found = self._lookup()
+        if found is None:
+            return False
+        taskbar, start, pid = found
+        self._targets = frozenset(h for h in (taskbar, start) if h)
+        self._signature = found
+        self._hook = WinEventHook(
+            self._on_change,
+            ranges=((EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),),
+            process_id=pid,
+            accept=self._accept,
+        )
+        return self._hook.start()
+
+    def retarget(self):
+        """Re-install the hook if Explorer or the Start button window was replaced."""
+        found = self._lookup()
+        if found == self._signature and self.active:
+            return False
+        self.stop()
+        return self.start()
+
+    def stop(self):
+        hook, self._hook = self._hook, None
+        if hook is not None:
+            hook.stop()
