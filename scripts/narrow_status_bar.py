@@ -37,8 +37,12 @@ from api.provider_snapshot_api import (
     safe_failure as _safe_failure,
 )
 from api.win_shell_api import (
+    DisplayChangeWatcher,
     TaskbarWatcher,
     WinEventHook,
+    ensure_visible,
+    force_repaint,
+    move_window,
     primary_screen_size,
     primary_start_button_left,
     primary_taskbar_geometry,
@@ -46,6 +50,7 @@ from api.win_shell_api import (
     set_window_topmost,
     toplevel_hwnd,
     window_needs_topmost,
+    window_rect,
 )
 from api.virtual_desktop_api import (
     DESKTOP_NAMES,
@@ -78,6 +83,8 @@ TASKBAR_CHECK_INTERVAL_MS = 60 * 1000  # backstop while the taskbar watcher is a
 TASKBAR_POLL_FALLBACK_MS = 5 * 1000  # used only when the taskbar watcher cannot start
 GEOMETRY_EVENT_DEBOUNCE_MS = 400  # Explorer emits bursts of events while it re-lays out
 GEOMETRY_CONFIRM_MS = 1500  # one more pass after things settle
+DISPLAY_EVENT_DEBOUNCE_MS = 800  # a monitor switch emits a burst of WM_DISPLAYCHANGE
+DISPLAY_CONFIRM_MS = 2500  # forced refresh once more after the switch has settled
 WINDOW_CHECK_INTERVAL_MS = 15 * 1000  # backstop; WinEvent hook triggers the normal checks
 TOPMOST_EVENT_DEBOUNCE_MS = 150
 DESKTOP_POLL_FALLBACK_MS = 1000  # only used when the registry watcher cannot start
@@ -290,6 +297,15 @@ class NarrowBar(tk.Tk):
 
         self.geometry_debounce = Debouncer(self.after, self.after_cancel, GEOMETRY_EVENT_DEBOUNCE_MS, self._geometry_settled)
         self.geometry_confirm = Debouncer(self.after, self.after_cancel, GEOMETRY_CONFIRM_MS, self.apply_taskbar_alignment)
+        self.display_debounce = Debouncer(
+            self.after, self.after_cancel, DISPLAY_EVENT_DEBOUNCE_MS, self._display_settled
+        )
+        self.display_confirm = Debouncer(
+            self.after, self.after_cancel, DISPLAY_CONFIRM_MS,
+            lambda: self.refresh_overlay("display change (confirm)"),
+        )
+        self.display_watcher = DisplayChangeWatcher(self._display_signal)
+        LOGGER.info("display change watcher active=%s", self.display_watcher.start())
         self.geometry_watcher = TaskbarWatcher(self._geometry_signal)
         geometry_events = self.geometry_watcher.start()
         self.taskbar_poll_ms = TASKBAR_CHECK_INTERVAL_MS if geometry_events else TASKBAR_POLL_FALLBACK_MS
@@ -1052,6 +1068,44 @@ class NarrowBar(tk.Tk):
         }
         self.draw_bar()
 
+    def _display_signal(self):
+        """Watcher thread: only hand off to the Tk thread, never touch widgets here."""
+        try:
+            self.after(0, self.display_debounce.trigger)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _display_settled(self):
+        if self.closed:
+            return
+        self.refresh_overlay("display change")
+        self.display_confirm.trigger()
+
+    def refresh_overlay(self, reason):
+        """Unconditionally re-place, redraw and re-raise the bar (after a monitor switch)."""
+        if self.closed:
+            return
+        LOGGER.info("overlay refresh requested: %s", reason)
+        try:
+            self.geometry_watcher.retarget()
+        except Exception as error:
+            log_exception("taskbar watcher retarget failed", error)
+        try:
+            hwnd = toplevel_hwnd(self.winfo_id())
+            was_hidden = False
+            if self.state() == "withdrawn":  # Tk reports a window hidden by Windows this way too
+                self.deiconify()
+                was_hidden = True
+            was_hidden = ensure_visible(hwnd) or was_hidden
+            if was_hidden:
+                LOGGER.warning("overlay was hidden (%s); shown again", reason)
+            self.apply_taskbar_alignment(force=True)
+            self.apply_transparency()
+            set_window_topmost(hwnd)
+            force_repaint(hwnd)
+        except tk.TclError as error:
+            log_exception("overlay refresh failed", error)
+
     def _geometry_signal(self):
         """Hook thread: only hand off to the Tk thread, never touch widgets here."""
         try:
@@ -1081,7 +1135,7 @@ class NarrowBar(tk.Tk):
         if not self.closed:
             self.taskbar_alignment_job = self.after(self.taskbar_poll_ms, self.ensure_taskbar_alignment)
 
-    def apply_taskbar_alignment(self):
+    def apply_taskbar_alignment(self, force=False):
         if self.closed:
             return
         try:
@@ -1112,8 +1166,16 @@ class NarrowBar(tk.Tk):
             elif new_start_left is not None and self.start_boundary_unavailable:
                 LOGGER.info("Start button boundary detected; overlay width restored")
             self.start_boundary_unavailable = new_start_left is None
+            # Trust the real window, not our own bookkeeping: Windows may move or resize
+            # it during a display switch without us ever having changed our own values.
+            hwnd = toplevel_hwnd(self.winfo_id())
+            actual = window_rect(hwnd)
+            desired = (current_x, new_taskbar_y, current_x + new_width, new_taskbar_y + new_height)
+            off_target = actual is not None and actual != desired
             if (
-                environment_changed
+                force
+                or off_target
+                or environment_changed
                 or new_screen_width != self.screen_width
                 or new_screen_height != self.screen_height
                 or new_height != self.bar_height
@@ -1129,13 +1191,17 @@ class NarrowBar(tk.Tk):
                 self.bar_width = new_width
                 self.column_edges = column_layout(self.bar_width)
                 self.geometry(f"{self.bar_width}x{self.bar_height}+{current_x}+{self.taskbar_y}")
+                self.update_idletasks()
+                if window_rect(hwnd) != desired:
+                    move_window(hwnd, current_x, self.taskbar_y, self.bar_width, self.bar_height)
                 self.canvas.configure(width=self.bar_width, height=self.bar_height)
                 if (current_x, self.taskbar_y) != (self.settings.get("x"), self.settings.get("y")):
                     self.settings.update(x=current_x, y=self.taskbar_y)
                     save_settings(self.settings)
                 self.draw_bar()
                 LOGGER.info(
-                    "overlay layout recalculated: screen=%sx%s taskbar=%sx%s x=%s start-left=%s width=%s columns=%s",
+                    "overlay layout recalculated: screen=%sx%s taskbar=%sx%s x=%s start-left=%s width=%s columns=%s"
+                    " | forced=%s off-target=%s actual=%s",
                     new_screen_width,
                     new_screen_height,
                     new_height,
@@ -1144,6 +1210,9 @@ class NarrowBar(tk.Tk):
                     new_start_left,
                     new_width,
                     self.column_edges,
+                    force,
+                    off_target,
+                    actual,
                 )
             self.layout_signature = signature
             self.screen_width = new_screen_width
@@ -1221,6 +1290,12 @@ class NarrowBar(tk.Tk):
         self._hide_tooltip()
         self.geometry_debounce.cancel()
         self.geometry_confirm.cancel()
+        self.display_debounce.cancel()
+        self.display_confirm.cancel()
+        try:
+            self.display_watcher.stop()
+        except Exception as error:
+            log_exception("stopping display change watcher failed", error)
         try:
             self.geometry_watcher.stop()
         except Exception as error:
