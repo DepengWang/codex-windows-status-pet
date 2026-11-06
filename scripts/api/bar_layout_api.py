@@ -20,7 +20,9 @@ MIN_PREFERRED_BAR_WIDTH = 180
 CAPSULE_NAME_WIDTH = 72
 CAPSULE_PRIMARY_WIDTH = 68
 CAPSULE_WEEKLY_WIDTH = 68
-CAPSULE_MAX_WIDTH = CAPSULE_NAME_WIDTH + CAPSULE_PRIMARY_WIDTH + CAPSULE_WEEKLY_WIDTH
+CAPSULE_MIN_WIDTH = CAPSULE_NAME_WIDTH + CAPSULE_PRIMARY_WIDTH + CAPSULE_WEEKLY_WIDTH
+# With a little more room the capsule also keeps the mic battery column.
+CAPSULE_MIC_WIDTH = CAPSULE_MIN_WIDTH + MIC_BATTERY_COLUMN_WIDTH
 
 # Column order after the name column:
 #   primary, weekly, third, mic battery, desktop 1, desktop 2, desktop 3
@@ -35,6 +37,8 @@ LAYOUT_TIERS = (
     ("no_third", (PRIMARY_COLUMN_WIDTH, WEEKLY_COLUMN_WIDTH, 0, 0, 0, 0, 0)),
 )
 CAPSULE = "capsule"
+CAPSULE_MIC = "capsule_mic"
+COMPACT_MODES = (CAPSULE, CAPSULE_MIC)
 COMPACT_BELOW = NAME_COLUMN_MAX + sum(LAYOUT_TIERS[-1][1])  # narrower than this -> capsule
 
 
@@ -48,7 +52,7 @@ def layout_mode(width):
     for name, preferred in LAYOUT_TIERS:
         if width >= NAME_COLUMN_MAX + sum(preferred):
             return name
-    return CAPSULE
+    return CAPSULE_MIC if width >= CAPSULE_MIC_WIDTH else CAPSULE
 
 
 def _share(width, preferred):
@@ -76,7 +80,7 @@ def width_before_start_button(x, start_left=None, gap=8):
         start_left = screen_width
     available = min(MAX_PREFERRED_BAR_WIDTH, int(start_left - int(x) - gap))
     if available < COMPACT_BELOW:
-        available = min(available, CAPSULE_MAX_WIDTH)
+        available = min(available, CAPSULE_MIC_WIDTH if available >= CAPSULE_MIC_WIDTH else CAPSULE_MIN_WIDTH)
     return max(1, available)
 
 
@@ -87,9 +91,12 @@ def column_layout(width):
     """
     width = _clamp_width(width)
     mode = layout_mode(width)
-    if mode == CAPSULE:
-        name, primary, weekly = _share(width, (CAPSULE_NAME_WIDTH, CAPSULE_PRIMARY_WIDTH, CAPSULE_WEEKLY_WIDTH))
-        columns = [primary, weekly, 0, 0, 0, 0, 0]
+    if mode in COMPACT_MODES:
+        with_mic = MIC_BATTERY_COLUMN_WIDTH if mode == CAPSULE_MIC else 0
+        name, primary, weekly, mic = _share(
+            width, (CAPSULE_NAME_WIDTH, CAPSULE_PRIMARY_WIDTH, CAPSULE_WEEKLY_WIDTH, with_mic)
+        )
+        columns = [primary, weekly, 0, mic, 0, 0, 0]
     else:
         preferred = dict(LAYOUT_TIERS)[mode]
         name = NAME_COLUMN_MAX

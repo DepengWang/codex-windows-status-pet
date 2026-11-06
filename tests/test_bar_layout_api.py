@@ -6,7 +6,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 from api.bar_layout_api import (
     CAPSULE,
-    CAPSULE_MAX_WIDTH,
+    CAPSULE_MIC,
+    CAPSULE_MIC_WIDTH,
+    CAPSULE_MIN_WIDTH,
     COMPACT_BELOW,
     LAYOUT_TIERS,
     MAX_PREFERRED_BAR_WIDTH,
@@ -31,9 +33,11 @@ class WidthBeforeStartButtonTests(unittest.TestCase):
     def test_never_returns_less_than_one_pixel(self):
         self.assertEqual(width_before_start_button(2000, start_left=100), 1)
 
-    def test_capsule_does_not_stretch_over_the_free_space(self):
+    def test_compact_forms_do_not_stretch_over_the_free_space(self):
         free = COMPACT_BELOW - 1  # still too narrow for the leanest tier
-        self.assertEqual(width_before_start_button(0, start_left=free + 8), CAPSULE_MAX_WIDTH)
+        self.assertEqual(width_before_start_button(0, start_left=free + 8), CAPSULE_MIC_WIDTH)
+        just_short = CAPSULE_MIC_WIDTH - 1
+        self.assertEqual(width_before_start_button(0, start_left=just_short + 8), CAPSULE_MIN_WIDTH)
 
     def test_capsule_still_shrinks_when_less_space_than_its_cap(self):
         self.assertEqual(width_before_start_button(0, start_left=150 + 8), 150)
@@ -49,7 +53,8 @@ class LayoutModeTests(unittest.TestCase):
             791: "no_desktops", 576: "no_desktops",
             575: "no_mic", 507: "no_mic",
             506: "no_third", 398: "no_third",
-            397: CAPSULE, 208: CAPSULE, 1: CAPSULE,
+            397: CAPSULE_MIC, 277: CAPSULE_MIC,
+            276: CAPSULE, 208: CAPSULE, 1: CAPSULE,
         }
         for width, mode in expected.items():
             self.assertEqual(layout_mode(width), mode, width)
@@ -60,7 +65,7 @@ class LayoutModeTests(unittest.TestCase):
         )
 
     def test_mode_is_monotonic_in_width(self):
-        order = [name for name, _ in LAYOUT_TIERS] + [CAPSULE]
+        order = [name for name, _ in LAYOUT_TIERS] + [CAPSULE_MIC, CAPSULE]
         ranks = [order.index(layout_mode(width)) for width in range(1, 1000)]
         self.assertEqual(ranks, sorted(ranks, reverse=True))
 
@@ -104,9 +109,16 @@ class ColumnLayoutTests(unittest.TestCase):
         self.assertTrue(all(no_third[:2]))
 
     def test_capsule_shows_name_and_two_percent_columns_only(self):
-        edges = column_layout(CAPSULE_MAX_WIDTH)
+        edges = column_layout(CAPSULE_MIN_WIDTH)
         self.assertEqual(edges[:4], (0, 72, 140, 208))
         self.assertEqual(set(edges[3:]), {208})
+
+    def test_capsule_with_mic_keeps_the_battery_column_and_nothing_else(self):
+        edges = column_layout(CAPSULE_MIC_WIDTH)
+        self.assertEqual(edges[:4], (0, 72, 140, 208))
+        self.assertEqual(edges[4], 208, "third column stays hidden")
+        self.assertEqual(edges[5] - edges[4], 69, "mic battery column at its preferred width")
+        self.assertEqual(set(edges[5:]), {CAPSULE_MIC_WIDTH}, "desktop columns stay hidden")
 
     def test_capsule_columns_stay_proportional_when_narrower(self):
         edges = column_layout(150)

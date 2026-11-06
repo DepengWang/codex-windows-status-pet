@@ -22,7 +22,7 @@ from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
 from api.quota_format_api import earliest_future_expiry, reset_display_date
 from api.quota_parse_api import parse_quota_payload
 from api.bar_layout_api import (
-    CAPSULE,
+    COMPACT_MODES,
     MIN_PREFERRED_BAR_WIDTH,
     column_layout,
     layout_mode,
@@ -558,7 +558,7 @@ class NarrowBar(tk.Tk):
             third_bg = CLAUDE_THIRD
             name_bg = CLAUDE_NAME
         pad = min(10, max(5, round(self.bar_width * 0.01)))
-        capsule = layout_mode(self.bar_width) == CAPSULE
+        capsule = layout_mode(self.bar_width) in COMPACT_MODES
 
         primary_segments = [
             ("5h ", self.font_ui),
