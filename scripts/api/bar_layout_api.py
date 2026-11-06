@@ -33,13 +33,14 @@ _DESKTOP = DESKTOP_COLUMN_WIDTH
 LAYOUT_TIERS = (
     ("full", (PRIMARY_COLUMN_WIDTH, WEEKLY_COLUMN_WIDTH, THIRD_COLUMN_WIDTH, MIC_BATTERY_COLUMN_WIDTH, _DESKTOP, _DESKTOP, _DESKTOP)),
     ("no_desktops", (PRIMARY_COLUMN_WIDTH, WEEKLY_COLUMN_WIDTH, THIRD_COLUMN_WIDTH, MIC_BATTERY_COLUMN_WIDTH, 0, 0, 0)),
-    ("no_mic", (PRIMARY_COLUMN_WIDTH, WEEKLY_COLUMN_WIDTH, THIRD_COLUMN_WIDTH, 0, 0, 0, 0)),
-    ("no_third", (PRIMARY_COLUMN_WIDTH, WEEKLY_COLUMN_WIDTH, 0, 0, 0, 0, 0)),
+    ("no_third", (PRIMARY_COLUMN_WIDTH, WEEKLY_COLUMN_WIDTH, 0, MIC_BATTERY_COLUMN_WIDTH, 0, 0, 0)),
 )
+# Hiding order as the space shrinks: desktop buttons, then the third column, and the mic
+# battery last (the capsule tiers below still keep it while they can).
 CAPSULE = "capsule"
 CAPSULE_MIC = "capsule_mic"
 COMPACT_MODES = (CAPSULE, CAPSULE_MIC)
-COMPACT_BELOW = NAME_COLUMN_MAX + sum(LAYOUT_TIERS[-1][1])  # narrower than this -> capsule
+COMPACT_BELOW = NAME_COLUMN_MAX + sum(LAYOUT_TIERS[-1][1])  # narrower than this -> capsule forms
 
 
 def _clamp_width(width):

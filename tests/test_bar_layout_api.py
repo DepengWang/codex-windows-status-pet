@@ -90,9 +90,8 @@ class LayoutModeTests(unittest.TestCase):
         expected = {
             792: "full", 900: "full",
             791: "no_desktops", 576: "no_desktops",
-            575: "no_mic", 507: "no_mic",
-            506: "no_third", 398: "no_third",
-            397: CAPSULE_MIC, 277: CAPSULE_MIC,
+            575: "no_third", 467: "no_third",
+            466: CAPSULE_MIC, 277: CAPSULE_MIC,
             276: CAPSULE, 208: CAPSULE, 1: CAPSULE,
         }
         for width, mode in expected.items():
@@ -100,7 +99,7 @@ class LayoutModeTests(unittest.TestCase):
 
     def test_boundaries_are_derived_from_the_column_widths(self):
         self.assertEqual(
-            [tier_minimum(name) for name, _ in LAYOUT_TIERS], [792, 576, 507, 398]
+            [tier_minimum(name) for name, _ in LAYOUT_TIERS], [792, 576, 467]
         )
 
     def test_mode_is_monotonic_in_width(self):
@@ -131,21 +130,27 @@ class ColumnLayoutTests(unittest.TestCase):
                     self.assertEqual(wanted == 0, got == 0, (name, width, index))
                     self.assertGreaterEqual(got, wanted, (name, width, index))
 
-    def test_each_tier_hides_exactly_the_agreed_columns(self):
+    def test_hiding_order_is_desktops_then_third_column_then_mic_last(self):
         def widths(edges):
+            # primary, weekly, third, mic, desktop 1-3
             return [edges[i + 1] - edges[i] for i in range(1, 8)]
 
         full = widths(column_layout(792))
         self.assertTrue(all(full))
         no_desktops = widths(column_layout(700))
         self.assertEqual(no_desktops[4:], [0, 0, 0])
-        self.assertTrue(all(no_desktops[:4]))
-        no_mic = widths(column_layout(540))
-        self.assertEqual(no_mic[3:], [0, 0, 0, 0])
-        self.assertTrue(all(no_mic[:3]))
-        no_third = widths(column_layout(450))
-        self.assertEqual(no_third[2:], [0, 0, 0, 0, 0])
-        self.assertTrue(all(no_third[:2]))
+        self.assertTrue(all(no_desktops[:4]), "third column and mic both still shown")
+        no_third = widths(column_layout(500))
+        self.assertEqual(no_third[2], 0, "third column hidden before the mic battery")
+        self.assertGreater(no_third[3], 0, "mic battery survives the loss of the third column")
+        self.assertEqual(no_third[4:], [0, 0, 0])
+        self.assertTrue(no_third[0] and no_third[1])
+
+    def test_mic_battery_is_the_last_column_to_go(self):
+        for width in range(COMPACT_BELOW - 1, CAPSULE_MIC_WIDTH - 1, -1):
+            edges = column_layout(width)
+            self.assertGreater(edges[5] - edges[4], 0, f"mic battery lost too early at {width}px")
+        self.assertEqual(column_layout(CAPSULE_MIC_WIDTH - 1)[5] - column_layout(CAPSULE_MIC_WIDTH - 1)[4], 0)
 
     def test_capsule_shows_name_and_two_percent_columns_only(self):
         edges = column_layout(CAPSULE_MIN_WIDTH)
