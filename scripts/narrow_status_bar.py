@@ -27,6 +27,7 @@ from api.quota_parse_api import parse_quota_payload
 
 
 PREFERRED_BAR_WIDTH = 792
+MAX_PREFERRED_BAR_WIDTH = 900
 NAME_COLUMN_MAX = 88
 NAME_COLUMN_MIN = 50
 PRIMARY_COLUMN_WIDTH = 140
@@ -191,7 +192,7 @@ def width_before_start_button(x, start_left=None, gap=8):
     if start_left is None:
         screen_width, _screen_height = primary_screen_size()
         start_left = screen_width
-    return max(1, min(PREFERRED_BAR_WIDTH, int(start_left - int(x) - gap)))
+    return max(1, min(MAX_PREFERRED_BAR_WIDTH, int(start_left - int(x) - gap)))
 
 
 def read_active_virtual_desktop_name():
@@ -222,7 +223,7 @@ def read_active_virtual_desktop_name():
 
 def column_layout(width):
     """Fit quota, desktop and mic battery indicators into the available width."""
-    width = max(1, min(PREFERRED_BAR_WIDTH, int(width)))
+    width = max(1, min(MAX_PREFERRED_BAR_WIDTH, int(width)))
     name = min(NAME_COLUMN_MAX, width)
     name_floor = min(NAME_COLUMN_MIN, width)
     name -= min(max(0, name - name_floor), max(0, PREFERRED_BAR_WIDTH - width))
