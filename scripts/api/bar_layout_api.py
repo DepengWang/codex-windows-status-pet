@@ -67,6 +67,76 @@ def _share(width, preferred):
 
 
 
+START_RETRY_INTERVAL_MS = 500
+START_RETRY_LIMIT = 20  # ~10 s; the slow backstop poll continues after that
+
+
+class StartBoundary:
+    """Remember the last good Start-button edge.
+
+    Explorer removes the taskbar's Start window for a second or two whenever the
+    Start menu is open, so "not found" usually means "temporarily hidden", not
+    "gone". Widening the bar to the screen edge at that moment covers the real
+    button, so a missing reading keeps the previous value and asks for a quick retry.
+    """
+
+    def __init__(self, initial=None):
+        self.held = initial
+        self.misses = 0
+
+    def update(self, raw):
+        """Feed a fresh reading (or None); returns the edge to lay out against."""
+        if raw is None:
+            self.misses += 1
+        else:
+            self.held = raw
+            self.misses = 0
+        return self.held
+
+    @property
+    def missing(self):
+        return self.misses > 0
+
+    @property
+    def should_retry(self):
+        return 0 < self.misses <= START_RETRY_LIMIT
+
+
+START_RETRY_INTERVAL_MS = 500
+START_RETRY_LIMIT = 20  # ~10 s; the slow backstop poll continues after that
+
+
+class StartBoundary:
+    """Remember the last good Start-button edge.
+
+    Explorer removes the taskbar's Start window for a second or two whenever the
+    Start menu is open, so "not found" usually means "temporarily hidden", not
+    "gone". Widening the bar to the screen edge at that moment covers the real
+    button, so a missing reading keeps the previous value and asks for a quick retry.
+    """
+
+    def __init__(self, initial=None):
+        self.held = initial
+        self.misses = 0
+
+    def update(self, raw):
+        """Feed a fresh reading (or None); returns the edge to lay out against."""
+        if raw is None:
+            self.misses += 1
+        else:
+            self.held = raw
+            self.misses = 0
+        return self.held
+
+    @property
+    def missing(self):
+        return self.misses > 0
+
+    @property
+    def should_retry(self):
+        return 0 < self.misses <= START_RETRY_LIMIT
+
+
 def width_before_start_button(x, start_left=None, gap=8):
     """Cap the strip at the live Start button boundary, leaving a small gap.
 

@@ -24,6 +24,8 @@ from api.quota_parse_api import parse_quota_payload
 from api.bar_layout_api import (
     COMPACT_MODES,
     MIN_PREFERRED_BAR_WIDTH,
+    START_RETRY_INTERVAL_MS,
+    StartBoundary,
     column_layout,
     layout_mode,
     width_before_start_button,
@@ -181,6 +183,7 @@ class NarrowBar(tk.Tk):
         self.settings = load_settings()
         self.bar_height, self.taskbar_y = primary_taskbar_geometry()
         self.start_button_left = primary_start_button_left()
+        self.start_boundary = StartBoundary(self.start_button_left)
         self.screen_width, self.screen_height = primary_screen_size()
         initial_x = max(-4, min(self.settings["x"], self.screen_width - 1))
         initial_width = width_before_start_button(initial_x, self.start_button_left)
@@ -297,6 +300,7 @@ class NarrowBar(tk.Tk):
 
         self.geometry_debounce = Debouncer(self.after, self.after_cancel, GEOMETRY_EVENT_DEBOUNCE_MS, self._geometry_settled)
         self.geometry_confirm = Debouncer(self.after, self.after_cancel, GEOMETRY_CONFIRM_MS, self.apply_taskbar_alignment)
+        self.start_retry = Debouncer(self.after, self.after_cancel, START_RETRY_INTERVAL_MS, self.apply_taskbar_alignment)
         self.display_debounce = Debouncer(
             self.after, self.after_cancel, DISPLAY_EVENT_DEBOUNCE_MS, self._display_settled
         )
@@ -755,7 +759,7 @@ class NarrowBar(tk.Tk):
     def begin_interaction(self, event):
         self._hide_tooltip()
         self.drag_origin = (event.x_root, event.y_root, self.winfo_x())
-        self.drag_start_left = primary_start_button_left()
+        self.drag_start_left = self.start_boundary.update(primary_start_button_left())
         self.drag_moved = False
 
     def move_interaction(self, event):
@@ -836,7 +840,7 @@ class NarrowBar(tk.Tk):
 
     def restore_default_position(self):
         self.settings.update(x=DEFAULT_X, y=self.taskbar_y)
-        self.start_button_left = primary_start_button_left()
+        self.start_button_left = self.start_boundary.update(primary_start_button_left())
         self.bar_width = width_before_start_button(DEFAULT_X, self.start_button_left)
         self.column_edges = column_layout(self.bar_width)
         self.canvas.configure(width=self.bar_width)
@@ -1142,7 +1146,10 @@ class NarrowBar(tk.Tk):
             new_height, new_taskbar_y = primary_taskbar_geometry()
             new_screen_width, new_screen_height = primary_screen_size()
             current_x = max(-4, min(self.winfo_x(), new_screen_width - 1))
-            new_start_left = primary_start_button_left()
+            raw_start_left = primary_start_button_left()
+            new_start_left = self.start_boundary.update(raw_start_left)
+            if raw_start_left is None and self.start_boundary.misses == 1:
+                LOGGER.info("Start button not found (Start menu open?); holding last boundary %s", new_start_left)
             new_width = width_before_start_button(current_x, new_start_left)
             signature = (
                 new_screen_width,
@@ -1217,6 +1224,8 @@ class NarrowBar(tk.Tk):
             self.layout_signature = signature
             self.screen_width = new_screen_width
             self.screen_height = new_screen_height
+            if self.start_boundary.should_retry:
+                self.start_retry.trigger()
         except tk.TclError as error:
             log_exception("taskbar alignment check failed", error)
 
@@ -1292,6 +1301,7 @@ class NarrowBar(tk.Tk):
         self.geometry_confirm.cancel()
         self.display_debounce.cancel()
         self.display_confirm.cancel()
+        self.start_retry.cancel()
         try:
             self.display_watcher.stop()
         except Exception as error:

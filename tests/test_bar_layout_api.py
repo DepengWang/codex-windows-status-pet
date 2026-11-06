@@ -13,6 +13,8 @@ from api.bar_layout_api import (
     LAYOUT_TIERS,
     MAX_PREFERRED_BAR_WIDTH,
     NAME_COLUMN_MAX,
+    START_RETRY_LIMIT,
+    StartBoundary,
     column_layout,
     layout_mode,
     width_before_start_button,
@@ -44,6 +46,43 @@ class WidthBeforeStartButtonTests(unittest.TestCase):
 
     def test_leanest_tier_is_not_capped(self):
         self.assertEqual(width_before_start_button(0, start_left=COMPACT_BELOW + 8), COMPACT_BELOW)
+
+
+class StartBoundaryTests(unittest.TestCase):
+    def test_missing_reading_keeps_the_last_good_edge(self):
+        boundary = StartBoundary(881)
+        self.assertEqual(boundary.update(None), 881)  # Start menu open: window temporarily gone
+        self.assertTrue(boundary.missing)
+        self.assertEqual(boundary.update(None), 881)
+
+    def test_fresh_reading_replaces_the_edge_and_clears_the_miss_count(self):
+        boundary = StartBoundary(881)
+        boundary.update(None)
+        self.assertEqual(boundary.update(859), 859)
+        self.assertFalse(boundary.missing)
+        self.assertEqual(boundary.misses, 0)
+
+    def test_retries_only_while_missing_and_within_the_limit(self):
+        boundary = StartBoundary(881)
+        self.assertFalse(boundary.should_retry)
+        for _ in range(START_RETRY_LIMIT):
+            boundary.update(None)
+            self.assertTrue(boundary.should_retry)
+        boundary.update(None)
+        self.assertFalse(boundary.should_retry, "give up quick retries; the slow backstop continues")
+        boundary.update(900)
+        self.assertFalse(boundary.should_retry)
+
+    def test_unknown_at_startup_stays_unknown_until_first_reading(self):
+        boundary = StartBoundary()
+        self.assertIsNone(boundary.update(None))
+        self.assertTrue(boundary.should_retry)
+        self.assertEqual(boundary.update(903), 903)
+
+    def test_held_edge_keeps_the_bar_clear_of_the_start_button(self):
+        boundary = StartBoundary(881)
+        held = boundary.update(None)
+        self.assertEqual(width_before_start_button(-4, start_left=held), 877)
 
 
 class LayoutModeTests(unittest.TestCase):
