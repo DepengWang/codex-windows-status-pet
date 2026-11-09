@@ -1,4 +1,4 @@
-"""Read the connected DJI Mic Mini 2 battery from Windows PnP properties.
+"""Read configured Bluetooth device batteries from Windows PnP properties.
 
 Uses CfgMgr32 in-process (no PowerShell child process); one read takes
 milliseconds instead of seconds of process start-up and PnP enumeration.
@@ -15,6 +15,8 @@ from ctypes import wintypes
 
 # Last six hex digits of the transmitter's Bluetooth address -> display label.
 DEVICE_LABELS = {"6F775D": "GPT", "6F3291": "CC"}
+MIC_LABELS = frozenset(DEVICE_LABELS.values())
+DEVICE_NAME_PATTERNS = {"KEY": re.compile(r"^IINE_KeyBoard$", re.IGNORECASE)}
 _NODE_NAME = re.compile(r"^DJI Mic Mini 2-([0-9A-F]{6}) Hands-Free AG$")
 _ENDPOINT_NAME = re.compile(r"\(DJI Mic Mini 2-([0-9A-F]{6}) Hands-Free\)")
 
@@ -86,9 +88,11 @@ def _api():
     return _cfgmgr
 
 
-def _present_instance_ids(class_guid):
+def _present_instance_ids(class_guid=None):
     lib = _api()
-    flags = _CM_GETIDLIST_FILTER_CLASS | _CM_GETIDLIST_FILTER_PRESENT
+    flags = _CM_GETIDLIST_FILTER_PRESENT
+    if class_guid is not None:
+        flags |= _CM_GETIDLIST_FILTER_CLASS
     for _ in range(3):  # the list can grow between the size and read calls
         size = wintypes.ULONG(0)
         if lib.CM_Get_Device_ID_List_SizeW(ctypes.byref(size), class_guid, flags) != _CR_SUCCESS:
@@ -97,7 +101,6 @@ def _present_instance_ids(class_guid):
         if lib.CM_Get_Device_ID_ListW(class_guid, buffer, size.value, flags) == _CR_SUCCESS:
             return [item for item in ctypes.wstring_at(buffer, size.value).split("\0") if item]
     raise RuntimeError("Windows could not enumerate devices")
-
 
 def _property(instance_id, key, expected_type):
     """Return the raw property bytes, or None when the device lacks the property."""
@@ -127,20 +130,18 @@ def _friendly_name(instance_id):
 
 
 def _payload_from_windows():
-    # Keep a row for each known transmitter so the overlay can tell an offline
-    # device from a missing reading without showing cached battery data.
-    readings = {label: {"label": label, "connected": False, "level": None} for label in ("CC", "GPT")}
-
-    # A live audio endpoint proves the transmitter is connected right now; a
-    # paired-but-away transmitter still exposes a cached battery property.
+    # Mic connectivity is confirmed by an active audio endpoint. Generic
+    # Bluetooth devices use Windows' present-device list and the same battery
+    # property reader, matched by configured friendly name.
+    readings = {
+        label: {"label": label, "connected": False, "level": None}
+        for label in ("GPT", "CC", *DEVICE_NAME_PATTERNS)
+    }
     active = set()
     for instance_id in _present_instance_ids(_CLASS_AUDIO_ENDPOINT):
         match = _ENDPOINT_NAME.search(_friendly_name(instance_id))
         if match:
             active.add(match.group(1).upper())
-    if not active:
-        return {"connected": False, "devices": list(readings.values())}
-
     for instance_id in _present_instance_ids(_CLASS_SYSTEM):
         if "BTHENUM" not in instance_id.upper():
             continue
@@ -153,11 +154,27 @@ def _payload_from_windows():
             continue
         raw = _property(instance_id, _KEY_BATTERY_LEVEL, _DEVPROP_TYPE_BYTE)
         level = raw[0] if raw and 0 <= raw[0] <= 100 else None
-        readings[label].update(connected=True, level=level)
-
+        current = readings[label]
+        current["connected"] = True
+        if level is not None or current["level"] is None:
+            current["level"] = level
+    for instance_id in _present_instance_ids():
+        friendly_name = _friendly_name(instance_id).strip()
+        label = next(
+            (name for name, pattern in DEVICE_NAME_PATTERNS.items()
+             if pattern.fullmatch(friendly_name)),
+            None,
+        )
+        if label is None:
+            continue
+        raw = _property(instance_id, _KEY_BATTERY_LEVEL, _DEVPROP_TYPE_BYTE)
+        level = raw[0] if raw and 0 <= raw[0] <= 100 else None
+        current = readings[label]
+        current["connected"] = True
+        if level is not None or current["level"] is None:
+            current["level"] = level
     devices = list(readings.values())
     return {"connected": any(item["connected"] for item in devices), "devices": devices}
-
 
 def _validated_devices(payload):
     devices = payload.get("devices")
@@ -168,7 +185,7 @@ def _validated_devices(payload):
 
     validated = []
     for device in devices:
-        if not isinstance(device, dict) or device.get("label") not in {"GPT", "CC"}:
+        if not isinstance(device, dict) or device.get("label") not in {"GPT", "CC", "KEY"}:
             continue
         level = device.get("level")
         if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 100:
@@ -181,36 +198,36 @@ def _validated_devices(payload):
 
 
 def _display_choice(devices):
-    connected_devices = [device for device in devices if device["connected"]]
+    connected_devices = [
+        device for device in devices
+        if device["connected"] and device["label"] in MIC_LABELS
+    ]
     if not connected_devices:
         return "MIC", None, None
     if len(connected_devices) == 1:
         device = connected_devices[0]
         return device["label"], device["level"], device["label"]
-
     if any(device["level"] is None for device in connected_devices):
         return "MIC", None, None
     lowest = min(connected_devices, key=lambda device: (device["level"], device["label"]))
     return "MIC", lowest["level"], lowest["label"]
 
-
-def _reading_from_payload(payload):
+def _reading_from_payload(payload, allowed_labels=None):
     devices = _validated_devices(payload)
+    if allowed_labels is not None:
+        devices = [device for device in devices if device["label"] in allowed_labels]
     label, level, selected = _display_choice(devices)
+    mic_devices = [device for device in devices if device["label"] in MIC_LABELS]
     return {
-        "connected": any(device["connected"] for device in devices),
+        "connected": any(device["connected"] for device in mic_devices),
         "label": label,
         "level": level,
         "selected": selected,
         "devices": devices,
     }
-
-
-def read_connected_dji_mic_mini_2_battery():
-    """Return live GPT/CC HFP readings, marking paired but inactive devices offline.
-
-    Matching an active Windows audio endpoint prevents a cached battery level
-    from a paired but disconnected transmitter from being shown as current.
-    Both known transmitters are included so the UI can display an offline row.
-    """
+def read_configured_device_batteries():
+    """Return Mic and configured generic-device readings from Windows."""
     return _reading_from_payload(_payload_from_windows())
+def read_connected_dji_mic_mini_2_battery():
+    """Compatibility API returning only the two DJI Mic Mini 2 readings."""
+    return _reading_from_payload(_payload_from_windows(), MIC_LABELS)

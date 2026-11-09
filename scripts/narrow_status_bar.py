@@ -16,7 +16,7 @@ from tkinter import font as tkfont
 
 from api.claude_usage_api import ClaudeUsageClient
 from api.debounce_api import Debouncer
-from api.bluetooth_battery_api import read_connected_dji_mic_mini_2_battery
+from api.bluetooth_battery_api import read_configured_device_batteries
 from api.codex_transport_api import AppServer
 from api.narrow_bar_logging_api import LOGGER, configure_logging, log_exception
 from api.quota_format_api import earliest_future_expiry, reset_display_date
@@ -91,7 +91,6 @@ WINDOW_CHECK_INTERVAL_MS = 15 * 1000  # backstop; WinEvent hook triggers the nor
 TOPMOST_EVENT_DEBOUNCE_MS = 150
 DESKTOP_POLL_FALLBACK_MS = 1000  # only used when the registry watcher cannot start
 DESKTOP_SAFETY_POLL_MS = 30 * 1000  # backstop while the watcher is active
-MIC_BATTERY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
 
 
@@ -206,7 +205,6 @@ class NarrowBar(tk.Tk):
         )
         self.taskbar_alignment_job = None
         self.desktop_check_job = None
-        self.mic_battery_job = None
         if self.start_boundary_unavailable:
             LOGGER.warning("Start button boundary unavailable; using primary screen edge as width limit")
         self.title("Codex and Claude Usage")
@@ -235,6 +233,7 @@ class NarrowBar(tk.Tk):
         self.last_wake_mono = time.monotonic()
         self.last_action_error = None
         self.mic_battery_fetching = False
+        self.mic_battery_refresh_pending = False
         self.mic_battery = {
             "connected": False,
             "label": "MIC",
@@ -320,7 +319,6 @@ class NarrowBar(tk.Tk):
         self.after(WAKE_CHECK_INTERVAL_MS, self.check_wake)
         self.taskbar_alignment_job = self.after(self.taskbar_poll_ms, self.ensure_taskbar_alignment)
         self.desktop_check_job = self.after(self.desktop_poll_ms, self.check_active_desktop)
-        self.mic_battery_job = self.after(250, self.refresh_mic_battery)
         self.after(WINDOW_CHECK_INTERVAL_MS, self.check_window_visibility)
         self.topmost_job = None
         self.topmost_hook = WinEventHook(self._topmost_signal)
@@ -421,14 +419,28 @@ class NarrowBar(tk.Tk):
                 font=self.font_desktop,
             )
 
+    def _mic_battery_display_rows(self):
+        devices = {item["label"]: item for item in self.mic_battery["devices"]}
+        gpt = devices.get("GPT")
+        cc = devices.get("CC")
+        key = devices.get("KEY")
+        gpt_online = bool(gpt and gpt.get("connected"))
+        cc_online = bool(cc and cc.get("connected"))
+        if gpt_online and cc_online:
+            return [("GPT", gpt), ("CC", cc)]
+        if cc_online:
+            return [("KEY", key), ("CC", cc)]
+        if gpt_online:
+            return [("GPT", gpt), ("KEY", key)]
+        return [("GPT", gpt), ("CC", cc)]
+
     def _draw_mic_battery(self, edges):
         left, right = edges[4], edges[5]
         if right <= left:
             return
-        battery = self.mic_battery
-        devices = {item["label"]: item for item in battery["devices"]}
-        self._draw_mic_battery_line(left, right, self.bar_height / 4, "GPT", devices.get("GPT"))
-        self._draw_mic_battery_line(left, right, self.bar_height * 3 / 4, "CC", devices.get("CC"))
+        rows = self._mic_battery_display_rows()
+        self._draw_mic_battery_line(left, right, self.bar_height / 4, *rows[0])
+        self._draw_mic_battery_line(left, right, self.bar_height * 3 / 4, *rows[1])
 
     def _draw_mic_battery_line(self, left, right, y, label, device):
         level = device["level"] if device else None
@@ -650,10 +662,10 @@ class NarrowBar(tk.Tk):
         updated = battery["updated_at"]
         devices = {item["label"]: item for item in battery["devices"]}
         displayed = "; ".join(
-            f"{label} {devices[label]['level']}%"
-            if devices.get(label, {}).get("connected") and isinstance(devices[label].get("level"), int)
+            f"{label} {device['level']}%"
+            if device and device.get("connected") and isinstance(device.get("level"), int)
             else f"{label} --"
-            for label in ("GPT", "CC")
+            for label, device in self._mic_battery_display_rows()
         )
         lowest = (
             f"{battery['selected']} {level_text}"
@@ -667,7 +679,7 @@ class NarrowBar(tk.Tk):
             "Last checked: " + (datetime.fromtimestamp(updated).astimezone().strftime("%Y-%m-%d %H:%M:%S") if updated else "—"),
             "Source: Windows Bluetooth HFP device battery property",
         ]
-        for label in ("GPT", "CC"):
+        for label in ("GPT", "CC", "KEY"):
             device = next((item for item in battery["devices"] if item["label"] == label), None)
             device_level = device["level"] if device else None
             device_text = (
@@ -885,6 +897,7 @@ class NarrowBar(tk.Tk):
         self._start_provider_read("Codex", self._read_codex)
         self._start_provider_read("Claude", self._read_claude)
         self.last_claude_refresh = time.monotonic()
+        self.refresh_mic_battery()
 
     def _read_codex(self):
         try:
@@ -956,6 +969,7 @@ class NarrowBar(tk.Tk):
                 self.refresh()
             else:
                 self._start_provider_read("Codex", self._read_codex)
+                self.refresh_mic_battery()
             self.after(REFRESH_INTERVAL_MS, self.auto_refresh)
 
     def check_wake(self):
@@ -1029,22 +1043,21 @@ class NarrowBar(tk.Tk):
     def refresh_mic_battery(self):
         if self.closed:
             return
-        self.mic_battery_job = self.after(
-            MIC_BATTERY_REFRESH_INTERVAL_MS,
-            self.refresh_mic_battery,
-        )
         if self.mic_battery_fetching:
+            self.mic_battery_refresh_pending = True
+            LOGGER.info("Bluetooth battery refresh queued behind active read")
             return
+        self.mic_battery_refresh_pending = False
         self.mic_battery_fetching = True
         threading.Thread(
             target=self._mic_battery_worker,
-            name="dji-mic-battery-read",
+            name="bluetooth-device-battery-read",
             daemon=True,
         ).start()
 
     def _mic_battery_worker(self):
         try:
-            reading = read_connected_dji_mic_mini_2_battery()
+            reading = read_configured_device_batteries()
             error = None
         except Exception:
             reading = {
@@ -1055,7 +1068,7 @@ class NarrowBar(tk.Tk):
                 "devices": [],
             }
             error = "Windows battery property could not be read"
-            LOGGER.warning("DJI Mic Mini 2 battery property read failed")
+            LOGGER.warning("Bluetooth device battery property read failed")
         try:
             self.after(0, self._mic_battery_result, reading, error)
         except (tk.TclError, RuntimeError):
@@ -1071,6 +1084,9 @@ class NarrowBar(tk.Tk):
             "error": error,
         }
         self.draw_bar()
+        if self.mic_battery_refresh_pending:
+            self.mic_battery_refresh_pending = False
+            self.refresh_mic_battery()
 
     def _display_signal(self):
         """Watcher thread: only hand off to the Tk thread, never touch widgets here."""
@@ -1290,12 +1306,6 @@ class NarrowBar(tk.Tk):
             except tk.TclError:
                 pass
             self.desktop_check_job = None
-        if self.mic_battery_job is not None:
-            try:
-                self.after_cancel(self.mic_battery_job)
-            except tk.TclError:
-                pass
-            self.mic_battery_job = None
         self._hide_tooltip()
         self.geometry_debounce.cancel()
         self.geometry_confirm.cancel()
