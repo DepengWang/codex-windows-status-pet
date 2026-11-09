@@ -429,9 +429,9 @@ class NarrowBar(tk.Tk):
         if gpt_online and cc_online:
             return [("GPT", gpt), ("CC", cc)]
         if cc_online:
-            return [("KEY", key), ("CC", cc)]
+            return [("KBD", key), ("CC", cc)]
         if gpt_online:
-            return [("GPT", gpt), ("KEY", key)]
+            return [("GPT", gpt), ("KBD", key)]
         return [("GPT", gpt), ("CC", cc)]
 
     def _draw_mic_battery(self, edges):
@@ -687,7 +687,8 @@ class NarrowBar(tk.Tk):
                 if device and device.get("connected") and isinstance(device_level, int)
                 else "--"
             )
-            lines.append(f"{label}: {device_text}")
+            display_label = "KBD" if label == "KEY" else label
+            lines.append(f"{display_label}: {device_text}")
         if battery["error"]:
             lines.append("Failure: Windows battery property could not be read")
         return lines
